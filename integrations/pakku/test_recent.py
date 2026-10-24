@@ -5,6 +5,7 @@ import json
 import sys
 import types
 import unittest
+import httpx
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -81,6 +82,81 @@ class CacheTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(recent.RecentUnavailable, '稍后重试'):
                 await provider._cached(1, 2, None)
         provider._fetch.assert_awaited_once()
+
+
+class PoolFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def manager(self):
+        async def get(key, default=None):
+            return default
+        return types.SimpleNamespace(get=get)
+
+    def xml(self):
+        return b'<i><d p="1,1,25,123,1792800000,0,user,1">current</d></i>'
+
+    def segment(self):
+        dm = integer(1, 2) + integer(2, 2000) + string(7, b'segmented') + integer(8, 1792800001)
+        return string(1, dm)
+
+    async def test_risk_control_keeps_current_xml_and_stops_remaining_segments(self):
+        provider = recent.RecentCommentProvider()
+        async def get(client, url):
+            if url.endswith('.xml'):
+                await asyncio.sleep(.01)  # A fast segment failure must not cancel this request.
+                return self.xml()
+            if '/view?' in url:
+                return string(4, integer(2, 4))
+            raise recent.BilibiliApiError(-352)
+        provider._get = AsyncMock(side_effect=get)
+        rows, info = await provider._fetch(1, 2, await self.manager())
+        self.assertEqual([row['id'] for row in rows], ['1'])
+        self.assertEqual(info['apiCodes'], [-352])
+        self.assertTrue(info['partial'])
+        self.assertEqual(info['segmentsFetched'], 0)
+        self.assertIn('当前XML', info['warning'])
+        segment_calls = [c for c in provider._get.call_args_list if '/seg.so?' in c.args[1]]
+        self.assertLessEqual(len(segment_calls), 2)
+
+    async def test_xml_failure_keeps_dated_segment_pool_with_warning(self):
+        provider = recent.RecentCommentProvider()
+        async def get(client, url):
+            if url.endswith('.xml'):
+                raise OSError('do not expose raw upstream failures')
+            return string(4, integer(2, 1)) if '/view?' in url else self.segment()
+        provider._get = AsyncMock(side_effect=get)
+        rows, info = await provider._fetch(1, 2, await self.manager())
+        self.assertEqual([row['id'] for row in rows], ['2'])
+        self.assertTrue(info['partial'])
+        self.assertFalse(info['xmlAvailable'])
+        self.assertEqual(info['segmentsFetched'], 1)
+        self.assertNotIn('OSError', info['warning'])
+
+    async def test_all_pool_failures_never_use_historical_rows(self):
+        provider = recent.RecentCommentProvider()
+        provider._get = AsyncMock(side_effect=recent.BilibiliApiError(-352))
+        with self.assertRaises(recent.RecentUnavailable):
+            await provider._fetch(1, 2, await self.manager())
+
+    async def test_healthy_pools_preserve_complete_status(self):
+        provider = recent.RecentCommentProvider()
+        async def get(client, url):
+            if url.endswith('.xml'):
+                return self.xml()
+            return string(4, integer(2, 1)) if '/view?' in url else self.segment()
+        provider._get = AsyncMock(side_effect=get)
+        rows, info = await provider._fetch(1, 2, await self.manager())
+        self.assertEqual(len(rows), 2)
+        self.assertFalse(info['partial'])
+        self.assertEqual(info['warning'], '')
+
+    async def test_json_api_error_keeps_only_safe_error_code(self):
+        provider = recent.RecentCommentProvider()
+        transport = httpx.MockTransport(lambda request: httpx.Response(200,
+            stream=httpx.ByteStream(b'{"code":-352,"message":"do not expose this payload"}')))
+        async with httpx.AsyncClient(transport=transport) as client:
+            with self.assertRaises(recent.BilibiliApiError) as caught:
+                await provider._get(client, 'https://api.bilibili.com/test')
+        self.assertEqual(caught.exception.code, -352)
+        self.assertNotIn('payload', str(caught.exception))
 
 
 class ScopedHookTests(unittest.IsolatedAsyncioTestCase):

@@ -238,9 +238,9 @@ export const PakkuSettings = () => {
           <Button loading={recentChecking} disabled={!loaded} onClick={checkRecent}>核查可获取数量（不保存）</Button>
         </Space>
         {recentError && <Alert type="error" showIcon className="mt-3" message={recentError} />}
-        {recentInfo && <Alert type="success" showIcon className="mt-3"
+        {recentInfo && <Alert type={recentInfo.partial ? 'warning' : 'success'} showIcon className="mt-3"
           message={`当前池去重后 ${recentInfo.availableCount} 条 → 选取最新 ${recentInfo.selectedCount} 条（目标 ${recentInfo.requestedCount}）；合并前数量。`}
-          description={`选取范围：${displayDate(recentInfo.oldestSendTime)} 至 ${displayDate(recentInfo.newestSendTime)}。获取时间：${displayDate(recentInfo.fetchedAt)}；缓存最多5分钟。`} />}
+          description={`${recentInfo.warning ? `${recentInfo.warning} ` : ''}${recentInfo.selectedCount < recentInfo.requestedCount ? '可获取数量不足目标，按实际条数返回。 ' : ''}选取范围：${displayDate(recentInfo.oldestSendTime)} 至 ${displayDate(recentInfo.newestSendTime)}。获取时间：${displayDate(recentInfo.fetchedAt)}；${recentInfo.partial ? '部分池不可用时缓存最多1分钟' : '缓存最多5分钟'}。`} />}
       </div>
       <Tabs items={tabs} />
       <div className="flex justify-between items-center flex-wrap gap-3 mb-5">

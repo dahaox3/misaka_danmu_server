@@ -88,7 +88,8 @@ class PakkuOutputMiddleware:
                 start['headers'] = [(k,v) for k,v in start.get('headers', []) if k.lower() not in (b'content-length', b'content-type', b'etag', b'content-encoding')]
                 if count and ctx.stats:
                     start['headers'] += [(b'x-pakku-recent-selected', str(ctx.stats.get('selectedCount', 0)).encode()),
-                                         (b'x-pakku-recent-available', str(ctx.stats.get('availableCount', 0)).encode())]
+                                         (b'x-pakku-recent-available', str(ctx.stats.get('availableCount', 0)).encode()),
+                                         (b'x-pakku-recent-partial', b'1' if ctx.stats.get('partial') else b'0')]
                 start['headers'] += [(b'content-length', str(len(body)).encode()), (b'content-type', content_type)]
                 await send(start)
                 await send({'type':'http.response.body','body':body,'more_body':False})

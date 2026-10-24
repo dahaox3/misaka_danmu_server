@@ -22,6 +22,12 @@ class RecentUnavailable(Exception):
     pass
 
 
+class BilibiliApiError(RecentUnavailable):
+    def __init__(self, code):
+        self.code = code if isinstance(code, int) else None
+        super().__init__('B站暂未返回可用弹幕，请稍后重试')
+
+
 @dataclass
 class RecentRequest:
     manager: object
@@ -185,7 +191,11 @@ class RecentCommentProvider:
                     raise RecentUnavailable('来源响应超出大小限制')
             raw = _decompress(bytes(raw), response.headers.get('content-encoding', ''))
         if raw.lstrip().startswith(b'{'):
-            raise RecentUnavailable('B站暂未返回可用弹幕，请稍后重试')
+            try:
+                code = json.loads(raw).get('code')
+            except (ValueError, AttributeError):
+                code = None
+            raise BilibiliApiError(code)
         return raw
 
     async def _fetch(self, aid, cid, manager):
@@ -197,26 +207,61 @@ class RecentCommentProvider:
         headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.bilibili.com/', 'Accept-Encoding': 'identity'}
         async with self.semaphore, httpx.AsyncClient(proxy=proxy or None, headers=headers,
                 timeout=httpx.Timeout(12, connect=5), trust_env=False, follow_redirects=False) as client:
-            view = await self._get(client, f'https://api.bilibili.com/x/v2/dm/web/view?type=1&oid={cid}&pid={aid}')
-            total = 0
-            for number, wire, value in proto_fields(view):
-                if number == 4 and wire == 2:
-                    total = int(dict((n, v) for n, _, v in proto_fields(value)).get(2, 0))
-            if not 1 <= total <= 32:
-                raise RecentUnavailable('未取得有效的B站弹幕分段信息')
-            per_video = asyncio.Semaphore(2)
-            async def segment(index):
-                async with per_video:
-                    raw = await self._get(client, f'https://api.bilibili.com/x/v2/dm/web/seg.so?type=1&oid={cid}&segment_index={index}')
-                    return decode_segment(raw)
-            xml_future = self._get(client, f'https://comment.bilibili.com/{cid}.xml')
-            results = await asyncio.gather(xml_future, *(segment(i) for i in range(1, total + 1)))
-            xml_rows = decode_xml(results[0])
-            rows = union_pools([xml_rows, *results[1:]])
+            async def xml_pool():
+                return decode_xml(await self._get(client, f'https://comment.bilibili.com/{cid}.xml'))
+
+            async def segment_pool():
+                view = await self._get(client, f'https://api.bilibili.com/x/v2/dm/web/view?type=1&oid={cid}&pid={aid}')
+                total = 0
+                for number, wire, value in proto_fields(view):
+                    if number == 4 and wire == 2:
+                        total = int(dict((n, v) for n, _, v in proto_fields(value)).get(2, 0))
+                if not 1 <= total <= 32:
+                    raise RecentUnavailable('未取得有效的B站弹幕分段信息')
+                per_video = asyncio.Semaphore(2)
+                blocked = False
+
+                async def segment(index):
+                    nonlocal blocked
+                    async with per_video:
+                        if blocked:
+                            raise RecentUnavailable('已暂停受限弹幕池的剩余请求')
+                        try:
+                            raw = await self._get(client, f'https://api.bilibili.com/x/v2/dm/web/seg.so?type=1&oid={cid}&segment_index={index}')
+                            return decode_segment(raw)
+                        except BilibiliApiError as exc:
+                            if exc.code in (-352, -412):
+                                blocked = True
+                            raise
+
+                # Wait for every started request before closing its HTTP client.
+                results = await asyncio.gather(*(segment(i) for i in range(1, total + 1)), return_exceptions=True)
+                good = [item for item in results if not isinstance(item, Exception)]
+                errors = [item for item in results if isinstance(item, Exception)]
+                return good, total, errors
+
+            xml_result, segment_result = await asyncio.gather(xml_pool(), segment_pool(), return_exceptions=True)
+            xml_ok = not isinstance(xml_result, Exception)
+            xml_rows = xml_result if xml_ok else []
+            if isinstance(segment_result, Exception):
+                segment_pools, total, errors = [], 0, [segment_result]
+            else:
+                segment_pools, total, errors = segment_result
+            rows = union_pools([xml_rows, *segment_pools])
             if not rows:
                 raise RecentUnavailable('来源未返回带发送日期的弹幕')
-            return rows, {'xmlCount': len(xml_rows), 'segmentCount': sum(map(len, results[1:])),
-                          'availableCount': len(rows), 'fetchedAt': int(time.time()), 'segments': total}
+            partial = not xml_ok or bool(errors)
+            codes = sorted({exc.code for exc in errors if isinstance(exc, BilibiliApiError) and exc.code is not None})
+            if codes and not segment_pools:
+                warning = f'B站分段接口受限（{", ".join(map(str, codes))}），本次仅从当前XML弹幕池选择；不代表全站完整的最新弹幕。'
+            elif partial:
+                warning = '部分B站弹幕池暂不可用，本次仅在成功获取的当前弹幕中选择；不代表全站完整的最新弹幕。'
+            else:
+                warning = ''
+            return rows, {'xmlCount': len(xml_rows), 'segmentCount': sum(map(len, segment_pools)),
+                          'availableCount': len(rows), 'fetchedAt': int(time.time()), 'segments': total,
+                          'xmlAvailable': xml_ok, 'segmentsFetched': len(segment_pools),
+                          'partial': partial, 'warning': warning, 'apiCodes': codes}
 
     async def _cached(self, aid, cid, manager):
         key = (aid, cid)
@@ -249,7 +294,8 @@ class RecentCommentProvider:
                     _, (_, _, removed_size) = self.cache.popitem(last=False)
                     self.cache_bytes -= removed_size
                 if size <= MAX_CACHE:
-                    self.cache[key] = (time.monotonic() + 300, result, size)
+                    ttl = 60 if result[1].get('partial') else 300
+                    self.cache[key] = (time.monotonic() + ttl, result, size)
                     self.cache_bytes += size
             return copy.deepcopy(result)
         except asyncio.CancelledError:
