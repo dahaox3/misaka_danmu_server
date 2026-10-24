@@ -1,0 +1,12 @@
+{
+  "name": "misaka-pakku-output",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node test-engine.mjs && node --test test-recent.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.21.5"
+  }
+}

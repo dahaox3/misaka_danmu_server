@@ -1,0 +1,6 @@
+node_modules/
+engine.mjs
+similarity-gen.wasm
+node
+*.tar.gz
+__pycache__/

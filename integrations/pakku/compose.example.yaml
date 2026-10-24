@@ -1,0 +1,26 @@
+# Merge these settings into your existing v2.8.9 deployment; retain your own secrets and databases.
+services:
+  misaka-danmu-server:
+    environment:
+      MISAKA_PAKKU_URL: http://pakku:17769/merge
+    volumes:
+      - ./release/gateway/pakku_entrypoint.py:/app/pakku_entrypoint.py:ro
+      - ./release/gateway/pakku_gateway.py:/app/pakku_gateway.py:ro
+      - ./release/gateway/run-gateway.sh:/run.sh:ro
+      - ./release/overrides/src/core/pakku_recent.py:/app/src/core/pakku_recent.py:ro
+      - ./release/overrides/src/core/pakku_settings.py:/app/src/core/pakku_settings.py:ro
+      - ./release/overrides/src/api/ui/pakku_config.py:/app/src/api/ui/pakku_config.py:ro
+      - ./release/overrides/src/api/dandan/pakku_merge.py:/app/src/api/dandan/pakku_merge.py:ro
+      - ./release/overrides/src/api/dandan/pakku_output.py:/app/src/api/dandan/pakku_output.py:ro
+      - ./release/overrides/web-dist:/app/web/dist:ro
+  pakku:
+    # Use the same pinned official application image, with a verified Node binary in release/pakku/node.
+    entrypoint: [/opt/pakku/node]
+    command: [--max-old-space-size=96, /opt/pakku/server.mjs]
+    user: '1000:1000'
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - ./release/pakku:/opt/pakku:ro
+    # Private Docker network only; do not publish port 17769.

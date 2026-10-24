@@ -30,6 +30,7 @@ import {
   generateRegex,
 } from '../../../apis'
 import { useMessage } from '../../../MessageContext'
+import { PakkuSettings } from './PakkuSettings'
 import { useTranslation } from 'react-i18next'
 
 const { TextArea } = Input
@@ -103,7 +104,6 @@ export const OutputManage = () => {
   const [topConvertTo, setTopConvertTo] = useState('none')
   const [bottomConvertTo, setBottomConvertTo] = useState('none')
   const [likesStyle, setLikesStyle] = useState('heart_white')
-
   const messageApi = useMessage()
 
   const getConfig = async () => {
@@ -374,6 +374,8 @@ export const OutputManage = () => {
           </Button>
         </div>
       </Card>
+
+      <PakkuSettings />
 
       <Card id="feat-bullet-color" loading={loading} title={t('bullet.colorTitle')} className="mt-4">
         <div className="text-sm text-gray-600 mb-3">

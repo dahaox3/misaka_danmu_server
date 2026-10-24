@@ -1,0 +1,3 @@
+[submodule "integrations/pakku/vendor/pakku"]
+	path = integrations/pakku/vendor/pakku
+	url = https://github.com/dahaox3/pakku.js
