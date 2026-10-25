@@ -225,11 +225,11 @@ export const PakkuSettings = () => {
           rules={[{ required: true, type: 'integer', min: 1, max: 120 }]}><InputNumber min={1} max={120} aria-label="重复弹幕合并时间范围" /></Form.Item>
       </div>
       <div className="border-t border-gray-200 py-4">
-        <p className="font-semibold mb-2">按发送日期选择最新弹幕</p>
+        <p className="font-semibold mb-2">B站：按发送日期选择最新弹幕</p>
         <Form.Item name="latestCount" initialValue={0} label="最新发送条数"
-          tooltip="先按观众发送日期选取最新N条，再执行原输出过滤和重复合并；合并后条数可能减少。0使用原来的全部输出。"
+          tooltip="仅对B站按观众发送日期选取最新N条，再执行原输出过滤和重复合并；其他来源使用全部弹幕并按现有参数合并。0表示B站也使用全部输出。"
           rules={[{required: true, type: 'integer', min: 0, max: 1000000}]}><RecentCountInput /></Form.Item>
-        <Alert type="info" showIcon className="mb-3" message="最新筛选目前支持B站来源，读取带发送日期的当前公开弹幕池，不修改原库。其他来源请选“全部”。最新N条不等于最近N天，也不保证覆盖平台全部历史弹幕。" />
+        <Alert type="info" showIcon className="mb-3" message="最新发送筛选只对B站生效；其他来源自动使用全部弹幕并按当前参数合并，无需切换设置。B站读取带发送日期的当前公开池，不修改原库；最新N条不等于最近N天，也不保证覆盖平台全部历史弹幕。" />
         <Space wrap>
           <Select aria-label="核查最新弹幕的分集" style={{minWidth: 280}} showSearch optionFilterProp="label"
             placeholder="选择库内B站分集" options={recentEpisodes} value={recentEpisode}

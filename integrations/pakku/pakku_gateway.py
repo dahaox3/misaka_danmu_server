@@ -61,8 +61,9 @@ class PakkuOutputMiddleware:
                 # Authentication errors and pending/failing jobs retain their exact protocol.
                 if not isinstance(data, dict) or data.get('success') is False or data.get('status') in ('pending', 'failed') or not isinstance(data.get('comments'), list):
                     raise ValueError('not a completed comment response')
-                if count and (ctx.error or not ctx.applied):
-                    raise RecentUnavailable(ctx.error or '此来源未提供发送日期；最新发送筛选目前支持B站，请选择全部')
+                # Only Bilibili's dated reader opts into recent selection.
+                # Other providers and native fallback/cache paths keep all rows
+                # and still pass through the same configured merge engine.
                 manager = self.owner_app.state.config_manager
                 merged = await apply_pakku_merge(data['comments'], manager)
                 # Native JSON has already removed font size. Preserve its color slot.
@@ -86,7 +87,9 @@ class PakkuOutputMiddleware:
                     content_type = b'application/json'
                 start = dict(state['start'])
                 start['headers'] = [(k,v) for k,v in start.get('headers', []) if k.lower() not in (b'content-length', b'content-type', b'etag', b'content-encoding')]
-                if count and ctx.stats:
+                if count:
+                    start['headers'].append((b'x-pakku-recent-mode', b'bilibili' if ctx.applied else b'all'))
+                if count and ctx.applied and ctx.stats:
                     start['headers'] += [(b'x-pakku-recent-selected', str(ctx.stats.get('selectedCount', 0)).encode()),
                                          (b'x-pakku-recent-available', str(ctx.stats.get('availableCount', 0)).encode()),
                                          (b'x-pakku-recent-partial', b'1' if ctx.stats.get('partial') else b'0')]
@@ -97,7 +100,9 @@ class PakkuOutputMiddleware:
                 body = json.dumps({'success': False, 'detail': str(exc), 'count': 0, 'comments': []}, ensure_ascii=False).encode()
                 start = dict(state['start'])
                 start['status'] = 503
-                start['headers'] = [(b'content-type', b'application/json'), (b'content-length', str(len(body)).encode())]
+                start['headers'] = [(k, v) for k, v in start.get('headers', [])
+                                    if k.lower() not in (b'content-length', b'content-type', b'content-encoding', b'etag')]
+                start['headers'] += [(b'content-type', b'application/json'), (b'content-length', str(len(body)).encode())]
                 await send(start)
                 await send({'type': 'http.response.body', 'body': body, 'more_body': False})
             except Exception:

@@ -318,7 +318,7 @@ class RecentCommentProvider:
         if row is None:
             return None, {}
         if row.providerName.lower() != 'bilibili':
-            raise RecentUnavailable('此来源没有可用的发送日期；最新发送筛选目前支持B站，请选择全部以使用其他来源')
+            return None, {'selectionMode': 'all', 'provider': row.providerName.lower()}
         # Misaka's Bilibili identifier is the exact aid,cid pair. Never choose
         # the first same-numbered season entry: that can be an episode preview.
         match = re.fullmatch(r'(\d{1,20}),(\d{1,20})', row.providerEpisodeId or '')
@@ -380,11 +380,13 @@ class RecentCommentProvider:
         old_get, old_set = native.get_db_cache, native.set_db_cache
         prefix = native.SAMPLED_COMMENTS_CACHE_PREFIX
         async def scoped_get(*args, **kwargs):
-            if current() is not None and len(args) > 1 and args[1] == prefix:
+            ctx = current()
+            if ctx is not None and ctx.applied and len(args) > 1 and args[1] == prefix:
                 return None
             return await old_get(*args, **kwargs)
         async def scoped_set(*args, **kwargs):
-            if current() is not None and len(args) > 1 and args[1] == prefix:
+            ctx = current()
+            if ctx is not None and ctx.applied and len(args) > 1 and args[1] == prefix:
                 return None
             return await old_set(*args, **kwargs)
         native.get_db_cache, native.set_db_cache = scoped_get, scoped_set

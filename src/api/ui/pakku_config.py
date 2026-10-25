@@ -96,6 +96,8 @@ async def recent_preview(payload: RecentPreviewRequest, request: Request,
         rows, info = await request.app.state.pakku_recent_provider.comments(
             session, payload.episodeId, payload.latestCount, manager)
         if rows is None:
+            if info.get('selectionMode') == 'all':
+                raise HTTPException(400, detail='该来源默认输出合并后的全部弹幕，不进行最新发送筛选；此核查工具用于B站分集')
             raise HTTPException(404, detail='分集不存在')
         return info
     except RecentUnavailable as exc:

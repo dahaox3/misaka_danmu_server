@@ -10,12 +10,15 @@ import pakku_gateway as gateway
 
 class GatewayTests(unittest.IsolatedAsyncioTestCase):
     async def request(self, payload, status=200, path='/api/v1/test/api/v2/comment/123',
-                      query=b'', headers=None, chunks=None, merge=None, latest=0, recent_error=''):
+                      query=b'', headers=None, chunks=None, merge=None, latest=0, recent_error='', recent_stats=None):
         raw = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
         sent = []
         async def app(scope, receive, send):
             if recent_error:
                 gateway.recent_request.get().error = recent_error
+            if recent_stats is not None:
+                ctx = gateway.recent_request.get()
+                ctx.applied, ctx.stats = True, recent_stats
             await send({'type': 'http.response.start', 'status': status,
                         'headers': headers or [(b'content-type', b'application/json'),
                                                (b'content-length', str(len(raw)).encode())]})
@@ -47,11 +50,26 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sent[1]['body'], raw)
             merge.assert_not_awaited()
 
-    async def test_recent_without_date_provider_is_explicit_not_historical_fallback(self):
-        sent, merge = await self.request({'comments': [{'p': '1,1,123', 'm': 'old'}]}, latest=1000)
-        self.assertEqual(sent[0]['status'], 503)
-        self.assertEqual(json.loads(sent[1]['body'])['comments'], [])
-        merge.assert_not_awaited()
+    async def test_non_bilibili_native_rows_are_all_given_to_merger_despite_latest_limit(self):
+        rows = [{'p': f'{i},1,123,[dandanplay]', 'm': str(i)} for i in range(3)]
+        merger = AsyncMock(return_value=rows[:2])
+        sent, merge = await self.request({'comments': rows}, latest=1, merge=merger)
+        self.assertEqual(sent[0]['status'], 200)
+        self.assertEqual(json.loads(sent[1]['body'])['count'], 2)
+        self.assertEqual(merge.await_args.args[0], rows)
+        headers = dict(sent[0]['headers'])
+        self.assertEqual(headers[b'x-pakku-recent-mode'], b'all')
+        self.assertNotIn(b'x-pakku-recent-selected', headers)
+
+    async def test_bilibili_applied_recent_selection_keeps_counts_and_mode(self):
+        rows = [{'p': '1,1,123,[bilibili]', 'm': 'recent'}]
+        sent, _ = await self.request({'comments': rows}, latest=5000,
+              recent_stats={'selectedCount': 5000, 'availableCount': 9000, 'partial': True})
+        self.assertEqual(sent[0]['status'], 200)
+        headers = dict(sent[0]['headers'])
+        self.assertEqual(headers[b'x-pakku-recent-mode'], b'bilibili')
+        self.assertEqual(headers[b'x-pakku-recent-selected'], b'5000')
+        self.assertEqual(headers[b'x-pakku-recent-partial'], b'1')
 
     async def test_recent_auth_failure_never_fetches_or_merges(self):
         sent, merge = await self.request(b'{"detail":"Unauthorized"}', status=401, latest=3000)
@@ -60,11 +78,14 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_recent_source_failure_remains_explicit_in_native_error_envelope(self):
         sent, merge = await self.request({'success': False, 'errorCode': 503},
-                                        latest=3000, recent_error='来源暂时不可用')
+                                        latest=3000, recent_error='来源暂时不可用',
+                                        headers=[(b'content-type', b'application/json'),
+                                                 (b'access-control-allow-origin', b'https://player.example')])
         self.assertEqual(sent[0]['status'], 503)
         data = json.loads(sent[1]['body'])
         self.assertEqual(data['detail'], '来源暂时不可用')
         self.assertEqual(data['comments'], [])
+        self.assertEqual(dict(sent[0]['headers'])[b'access-control-allow-origin'], b'https://player.example')
         merge.assert_not_awaited()
 
     async def test_json_merge_color_font_and_metadata(self):
@@ -85,7 +106,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_xml_preserves_position_font_and_escapes_text(self):
         rows = [{'p': '2,4,123,[bilibili]', 'm': '<hello>&\x01', 'fontSize': 38}]
-        sent, _ = await self.request({'comments': rows}, query=b'format=xml')
+        sent, _ = await self.request({'comments': rows}, query=b'format=xml', latest=5000)
         self.assertIn(b'application/xml', dict(sent[0]['headers'])[b'content-type'])
         node = ET.fromstring(sent[1]['body']).find('d')
         self.assertEqual(node.attrib['p'].split(',')[:4], ['2', '4', '38', '123'])
@@ -111,7 +132,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         merge.assert_not_awaited()
 
     async def test_empty_response_and_extcomment(self):
-        sent, merge = await self.request({'count': 0, 'comments': []}, path='/api/v1/test/extcomment')
+        sent, merge = await self.request({'count': 0, 'comments': []}, path='/api/v1/test/extcomment', latest=5000)
         self.assertEqual(json.loads(sent[1]['body']), {'count': 0, 'comments': []})
         merge.assert_awaited_once()
 

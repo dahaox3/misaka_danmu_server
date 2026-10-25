@@ -160,6 +160,48 @@ class PoolFailureTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ScopedHookTests(unittest.IsolatedAsyncioTestCase):
+    async def test_non_bilibili_provider_never_acquires_or_selects_dated_pool(self):
+        for provider_name in ('dandanplay', 'ezdmw', 'other'):
+            provider = recent.RecentCommentProvider()
+            provider._cached = AsyncMock()
+            row = types.SimpleNamespace(providerName=provider_name)
+            session = types.SimpleNamespace(execute=AsyncMock(return_value=types.SimpleNamespace(first=lambda: row)))
+            rows, info = await provider.comments(session, 123, 5000, None)
+            self.assertIsNone(rows)
+            self.assertEqual(info['selectionMode'], 'all')
+            provider._cached.assert_not_awaited()
+
+    async def test_non_bilibili_keeps_native_reader_and_sampling_cache(self):
+        rows = [{'m': 'all source comments without dates'}]
+        old = AsyncMock(return_value=rows)
+        old_set = AsyncMock()
+        crud = types.SimpleNamespace(fetch_comments=old, fetch_merged_comments=old)
+        native = types.SimpleNamespace(__name__='src.api.dandan.comments',
+                 get_db_cache=AsyncMock(return_value='native cache'),
+                 set_db_cache=old_set, SAMPLED_COMMENTS_CACHE_PREFIX='sampled')
+        async def endpoint():
+            result = await crud.fetch_comments(None, 123)
+            cached = await native.get_db_cache(None, 'sampled', 'key')
+            await native.set_db_cache(None, 'sampled', 'key', {})
+            return result, cached
+        endpoint.__module__ = native.__name__
+        route = types.SimpleNamespace(dependant=types.SimpleNamespace(call=endpoint))
+        provider = recent.RecentCommentProvider()
+        provider.comments = AsyncMock(return_value=(None, {'selectionMode': 'all'}))
+        db = types.ModuleType('src.db'); db.crud = crud
+        with patch.dict(sys.modules, {'src.db': db}), patch.object(recent.importlib, 'import_module', return_value=native):
+            provider.install(types.SimpleNamespace(routes=[route]))
+        ctx = recent.RecentRequest(None, 5000)
+        token = recent.recent_request.set(ctx)
+        try:
+            result, cached = await asyncio.create_task(route.dependant.call())
+            self.assertEqual(result, rows)
+            self.assertEqual(cached, 'native cache')
+            self.assertFalse(ctx.applied)
+            old_set.assert_awaited_once()
+        finally:
+            recent.recent_request.reset(token)
+
     async def test_endpoint_child_task_uses_recent_background_and_nonplayer_do_not(self):
         old = AsyncMock(return_value=[{'m': 'historical'}])
         old_set = AsyncMock()
