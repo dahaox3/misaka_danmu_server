@@ -4,7 +4,7 @@ import re
 import xml.etree.ElementTree as ET
 from fastapi import Response
 from fastapi.responses import JSONResponse
-from src.db import models
+from src.schemas.dandan import comment as models
 
 _XML_INVALID = re.compile('[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]')
 

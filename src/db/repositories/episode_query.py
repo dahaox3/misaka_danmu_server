@@ -552,6 +552,15 @@ class EpisodeQueryRepository:
         result = await self._session.execute(stmt)
         return [dict(row) for row in result.mappings().all()]
 
+    async def list_player_episodes_by_provider(self, provider: str, limit: int) -> list[dict]:
+        """按来源返回播放器核查列表，数据库先过滤再限制数量。"""
+        stmt = (select(Episode.id, Episode.title, Anime.title.label('animeTitle'))
+                .join(AnimeSource, Episode.sourceId == AnimeSource.id)
+                .join(Anime, AnimeSource.animeId == Anime.id)
+                .where(AnimeSource.providerName == provider)
+                .order_by(Anime.id.desc(), Episode.episodeIndex.desc()).limit(limit))
+        return [dict(row) for row in (await self._session.execute(stmt)).mappings()]
+
     async def get_episode_provider_info(self, episode_id: int) -> Optional[Dict[str, Any]]:
         """
         获取分集的提供方信息（用于任务系统）

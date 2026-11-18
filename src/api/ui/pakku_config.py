@@ -4,14 +4,12 @@ import os
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
-from src.db.orm_models import Episode, AnimeSource, Anime
 from src.core.pakku_recent import RecentUnavailable
-from sqlalchemy.ext.asyncio import AsyncSession
-from src import security
-from src.db import models, get_db_session, ConfigManager
-from src.db.crud.config import update_config_values_atomic
-from src.api.dependencies import get_config_manager
+from src.api.auth import get_current_user
+from src.schemas.auth import User
+from src.api.dependencies import get_config_service
+from src.services.config_service import ConfigService
+from src.services.service_container import get_database_service
 from src.core.pakku_settings import PakkuSettings, PakkuPreview, read_pakku_settings
 
 router = APIRouter()
@@ -33,8 +31,8 @@ async def run_engine(payload):
 
 @router.get('/config/pakku/settings', response_model=PakkuSettings)
 async def get_settings(
-    current_user: models.User = Depends(security.get_current_user),
-    manager: ConfigManager = Depends(get_config_manager),
+    current_user: User = Depends(get_current_user),
+    manager: ConfigService = Depends(get_config_service),
 ):
     return await read_pakku_settings(manager)
 
@@ -42,9 +40,8 @@ async def get_settings(
 @router.put('/config/pakku/settings', response_model=PakkuSettings)
 async def put_settings(
     payload: PakkuSettings,
-    current_user: models.User = Depends(security.get_current_user),
-    session: AsyncSession = Depends(get_db_session),
-    manager: ConfigManager = Depends(get_config_manager),
+    current_user: User = Depends(get_current_user),
+    manager: ConfigService = Depends(get_config_service),
 ):
     data = payload.model_dump()
     # Validate JS regular expressions with the actual engine BEFORE any DB write.
@@ -56,7 +53,9 @@ async def put_settings(
         'danmakuPakkuWindowSeconds': str(payload.windowSeconds),
         'danmakuPakkuOptions': json.dumps(data['options'], ensure_ascii=False),
     }
-    await update_config_values_atomic(session, values)
+    db = get_database_service()
+    async with db.transaction():
+        await db.config.update_config_values_atomic(values)
     for key in values:
         manager.invalidate(key)
     return payload
@@ -65,7 +64,7 @@ async def put_settings(
 @router.post('/config/pakku/preview')
 async def preview(
     payload: PakkuPreview,
-    current_user: models.User = Depends(security.get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     # Never save settings, comments, playback history or download tasks.
     return await run_engine(payload.model_dump())
@@ -78,23 +77,22 @@ class RecentPreviewRequest(BaseModel):
 
 
 @router.get('/config/pakku/recent/episodes')
-async def recent_episodes(current_user: models.User = Depends(security.get_current_user),
-                          session: AsyncSession = Depends(get_db_session)):
-    rows = (await session.execute(select(Episode.id, Episode.title, Anime.title.label('animeTitle'))
-            .join(AnimeSource, Episode.sourceId == AnimeSource.id).join(Anime, AnimeSource.animeId == Anime.id)
-            .where(AnimeSource.providerName == 'bilibili')
-            .order_by(Anime.id.desc(), Episode.episodeIndex.desc()).limit(1000))).all()
-    return [{'value': r.id, 'label': f'{r.animeTitle} · {r.title}'} for r in rows]
+async def recent_episodes(current_user: User = Depends(get_current_user)):
+    db = get_database_service()
+    async with db.transaction():
+        rows = await db.episode.list_player_episodes_by_provider('bilibili', 1000)
+    return [{'value': r['id'], 'label': f"{r['animeTitle']} · {r['title']}"} for r in rows]
 
 
 @router.post('/config/pakku/recent/preview')
 async def recent_preview(payload: RecentPreviewRequest, request: Request,
-                         current_user: models.User = Depends(security.get_current_user),
-                         session: AsyncSession = Depends(get_db_session),
-                         manager: ConfigManager = Depends(get_config_manager)):
+                         current_user: User = Depends(get_current_user),
+                         manager: ConfigService = Depends(get_config_service)):
     try:
-        rows, info = await request.app.state.pakku_recent_provider.comments(
-            session, payload.episodeId, payload.latestCount, manager)
+        db = get_database_service()
+        async with db.transaction():
+            rows, info = await request.app.state.pakku_recent_provider.comments(
+                db, payload.episodeId, payload.latestCount, manager)
         if rows is None:
             if info.get('selectionMode') == 'all':
                 raise HTTPException(400, detail='该来源默认输出合并后的全部弹幕，不进行最新发送筛选；此核查工具用于B站分集')

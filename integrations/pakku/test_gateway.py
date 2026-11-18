@@ -15,9 +15,9 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         sent = []
         async def app(scope, receive, send):
             if recent_error:
-                gateway.recent_request.get().error = recent_error
+                scope['state']['player_comment_reader'].keywords['ctx'].error = recent_error
             if recent_stats is not None:
-                ctx = gateway.recent_request.get()
+                ctx = scope['state']['player_comment_reader'].keywords['ctx']
                 ctx.applied, ctx.stats = True, recent_stats
             await send({'type': 'http.response.start', 'status': status,
                         'headers': headers or [(b'content-type', b'application/json'),
@@ -29,7 +29,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             sent.append(message)
         async def get(key, default=None):
             return str(latest) if key == 'danmakuPakkuLatestCount' else default
-        owner = SimpleNamespace(state=SimpleNamespace(config_manager=SimpleNamespace(get=get)))
+        owner = SimpleNamespace(state=SimpleNamespace(config_service=SimpleNamespace(get=get), pakku_recent_provider=SimpleNamespace(read_for_player=AsyncMock())))
         merger = merge or AsyncMock(side_effect=lambda comments, manager: comments)
         with patch.object(gateway, 'apply_pakku_merge', merger):
             await gateway.PakkuOutputMiddleware(app, owner)(
@@ -103,6 +103,10 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('_pakku_repeat_count', item)
         self.assertEqual(int(dict(sent[0]['headers'])[b'content-length']), len(sent[1]['body']))
         merge.assert_awaited_once()
+
+    async def test_completed_envelope_keeps_task_and_episode(self):
+        sent, _ = await self.request({'comments': [], 'status': 'completed', 'episodeId': 123, 'taskId': 'ok'})
+        self.assertEqual(json.loads(sent[1]['body']), {'count': 0, 'comments': [], 'status': 'completed', 'episodeId': 123, 'taskId': 'ok'})
 
     async def test_xml_preserves_position_font_and_escapes_text(self):
         rows = [{'p': '2,4,123,[bilibili]', 'm': '<hello>&\x01', 'fontSize': 38}]

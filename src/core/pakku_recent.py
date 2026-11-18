@@ -5,9 +5,8 @@ quotas, output filters and the original stored XML remain owned by Misaka.
 """
 import asyncio
 import copy
-import contextvars
-import importlib
 import json
+import os
 import re
 import time
 import zlib
@@ -32,13 +31,11 @@ class BilibiliApiError(RecentUnavailable):
 class RecentRequest:
     manager: object
     latest_count: int
-    task: object = field(default_factory=asyncio.current_task)
     applied: bool = False
     stats: dict = field(default_factory=dict)
     error: str = ''
 
 
-recent_request = contextvars.ContextVar('pakku_recent_request', default=None)
 MAX_RESPONSE = 8 * 1024 * 1024
 MAX_CACHE = 16 * 1024 * 1024
 MAX_ROWS = 100000
@@ -159,15 +156,19 @@ def _decompress(data, encoding):
 
 
 async def _select(rows, count):
-    import os
-    async with httpx.AsyncClient(timeout=httpx.Timeout(18, connect=2), trust_env=False) as client:
-        response = await client.post(os.environ.get('MISAKA_PAKKU_URL', 'http://pakku:17769/merge'),
-                                     json={'comments': rows, 'selectionOnly': True, 'latestCount': count})
-        response.raise_for_status()
-        selected = response.json()['comments']
-    allowed = {row['id'] for row in rows}
-    if not isinstance(selected, list) or len(selected) > count or any(row.get('id') not in allowed for row in selected):
-        raise RecentUnavailable('最新弹幕筛选结果无效')
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(18, connect=2), trust_env=False) as client:
+            response = await client.post(os.environ.get('MISAKA_PAKKU_URL', 'http://pakku:17769/merge'),
+                                         json={'comments': rows, 'selectionOnly': True, 'latestCount': count})
+            response.raise_for_status()
+            selected = response.json()['comments']
+        allowed = {row['id'] for row in rows}
+        if not isinstance(selected, list) or len(selected) > count or any(
+            not isinstance(row, dict) or row.get('id') not in allowed for row in selected
+        ):
+            raise ValueError('invalid selection')
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        raise RecentUnavailable('最新弹幕筛选引擎未返回可用结果，请稍后重试') from exc
     return selected
 
 
@@ -309,19 +310,15 @@ class RecentCommentProvider:
             if task.done() and self.inflight.get(key) is task:
                 self.inflight.pop(key, None)
 
-    async def comments(self, session, episode_id, count, manager):
-        from sqlalchemy import select
-        from src.db.orm_models import Episode, AnimeSource
-        row = (await session.execute(select(Episode.providerEpisodeId, Episode.sourceUrl,
-                        AnimeSource.providerName).join(AnimeSource, Episode.sourceId == AnimeSource.id)
-                        .where(Episode.id == episode_id))).first()
+    async def comments(self, database, episode_id, count, manager):
+        row = await database.episode.get_episode_provider_info(episode_id)
         if row is None:
             return None, {}
-        if row.providerName.lower() != 'bilibili':
-            return None, {'selectionMode': 'all', 'provider': row.providerName.lower()}
+        if row['providerName'].lower() != 'bilibili':
+            return None, {'selectionMode': 'all', 'provider': row['providerName'].lower()}
         # Misaka's Bilibili identifier is the exact aid,cid pair. Never choose
         # the first same-numbered season entry: that can be an episode preview.
-        match = re.fullmatch(r'(\d{1,20}),(\d{1,20})', row.providerEpisodeId or '')
+        match = re.fullmatch(r'(\d{1,20}),(\d{1,20})', row['providerEpisodeId'] or '')
         if not match or not all(int(x) > 0 for x in match.groups()):
             raise RecentUnavailable('该分集缺少有效B站视频标识，请重新选择正片来源')
         aid, cid = map(int, match.groups())
@@ -333,60 +330,14 @@ class RecentCommentProvider:
         selected.sort(key=lambda x: float(x['p'].split(',')[0]))
         return selected, info
 
-    def install(self, app):
-        """Scoped data-reader hooks; all official source files remain intact."""
-        from src.db import crud
-        native = importlib.import_module('src.api.dandan.comments')
-        if getattr(crud.fetch_comments, '_pakku_recent', False) is True:
-            raise RuntimeError('Recent provider already installed')
-        def current():
-            ctx = recent_request.get()
-            return ctx if ctx and ctx.latest_count and ctx.task is asyncio.current_task() else None
-        for name in ('fetch_comments', 'fetch_merged_comments'):
-            original = getattr(crud, name)
-            async def wrapped(session, episode_id, _original=original):
-                ctx = current()
-                if ctx is None:
-                    return await _original(session, episode_id)
-                try:
-                    rows, info = await self.comments(session, episode_id, ctx.latest_count, ctx.manager)
-                    if rows is None:
-                        return await _original(session, episode_id)
-                    ctx.applied, ctx.stats = True, info
-                    return rows
-                except RecentUnavailable as exc:
-                    ctx.error = str(exc)
-                    raise HTTPException(503, detail=ctx.error) from None
-            wrapped._pakku_recent = True
-            setattr(crud, name, wrapped)
-        # Uniform-sampling caches belong to the full historical output. A recent
-        # request must neither read those old rows nor poison them for later use.
-        # FastAPI/Starlette may run the endpoint in a child task. Bind the scope
-        # only at the authenticated endpoint, while inherited background tasks
-        # still have a different identity and keep the original database reader.
-        import functools
-        for route in app.routes:
-            dependant = getattr(route, 'dependant', None)
-            call = getattr(dependant, 'call', None)
-            if getattr(call, '__module__', '') != native.__name__:
-                continue
-            @functools.wraps(call)
-            async def endpoint(*args, _call=call, **kwargs):
-                ctx = recent_request.get()
-                if ctx:
-                    ctx.task = asyncio.current_task()
-                return await _call(*args, **kwargs)
-            dependant.call = endpoint
-        old_get, old_set = native.get_db_cache, native.set_db_cache
-        prefix = native.SAMPLED_COMMENTS_CACHE_PREFIX
-        async def scoped_get(*args, **kwargs):
-            ctx = current()
-            if ctx is not None and ctx.applied and len(args) > 1 and args[1] == prefix:
-                return None
-            return await old_get(*args, **kwargs)
-        async def scoped_set(*args, **kwargs):
-            ctx = current()
-            if ctx is not None and ctx.applied and len(args) > 1 and args[1] == prefix:
-                return None
-            return await old_set(*args, **kwargs)
-        native.get_db_cache, native.set_db_cache = scoped_get, scoped_set
+    async def read_for_player(self, database, episode_id, native_reader, ctx):
+        """仅在已鉴权的播放读取中筛选，不修改全局读取器或后台任务。"""
+        try:
+            rows, info = await self.comments(database, episode_id, ctx.latest_count, ctx.manager)
+        except RecentUnavailable as exc:
+            ctx.error = str(exc)
+            raise HTTPException(503, detail=ctx.error) from exc
+        if rows is None:
+            return await native_reader(episode_id)
+        ctx.applied, ctx.stats = True, info
+        return rows

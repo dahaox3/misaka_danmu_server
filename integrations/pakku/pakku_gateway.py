@@ -2,6 +2,7 @@
 
 No changes to rate limiting, integrity validation, download logic or authentication.
 """
+from functools import partial
 import json
 import logging
 import random
@@ -9,10 +10,10 @@ import re
 from urllib.parse import parse_qs
 
 from src.api.dandan.pakku_merge import apply_pakku_merge
-from src.api.dandan.danmaku_color import parse_palette, DEFAULT_RANDOM_COLOR_PALETTE
+from src.utils.danmaku_color import parse_palette, DEFAULT_RANDOM_COLOR_PALETTE
 from src.api.dandan.pakku_output import comment_output
-from src.db import models
-from src.core.pakku_recent import RecentRequest, RecentUnavailable, recent_request
+from src.schemas.dandan import comment as models
+from src.core.pakku_recent import RecentRequest, RecentUnavailable
 
 logger = logging.getLogger(__name__)
 _PATH = re.compile(r'^/api/v1/[^/]+/(?:api/v2/)?(?:comment/\d+|extcomment)$')
@@ -27,10 +28,14 @@ class PakkuOutputMiddleware:
     async def __call__(self, scope, receive, send):
         if scope.get('type') != 'http' or scope.get('method') != 'GET' or not _PATH.fullmatch(scope.get('path', '')):
             return await self.app(scope, receive, send)
-        manager = self.owner_app.state.config_manager
+        manager = self.owner_app.state.config_service
         count = int(await manager.get('danmakuPakkuLatestCount', '0'))
         ctx = RecentRequest(manager, count)
-        context_token = recent_request.set(ctx)
+        if count:
+            scope = dict(scope, state=dict(scope.get('state', {})))
+            scope['state']['player_comment_reader'] = partial(
+                self.owner_app.state.pakku_recent_provider.read_for_player, ctx=ctx)
+
         state = {'start': None, 'body': [], 'size': 0, 'pass': False}
 
         async def intercept(message):
@@ -64,7 +69,7 @@ class PakkuOutputMiddleware:
                 # Only Bilibili's dated reader opts into recent selection.
                 # Other providers and native fallback/cache paths keep all rows
                 # and still pass through the same configured merge engine.
-                manager = self.owner_app.state.config_manager
+                manager = self.owner_app.state.config_service
                 merged = await apply_pakku_merge(data['comments'], manager)
                 # Native JSON has already removed font size. Preserve its color slot.
                 palette = parse_palette(await manager.get('danmakuRandomColorPalette', DEFAULT_RANDOM_COLOR_PALETTE))
@@ -85,6 +90,10 @@ class PakkuOutputMiddleware:
                 else:
                     body = json.dumps(response.model_dump(exclude_none=True), ensure_ascii=False, separators=(',', ':')).encode()
                     content_type = b'application/json'
+                if output_format == 'json':
+                    # Preserve upstream async metadata and any future envelope fields.
+                    data.update(json.loads(body))
+                    body = json.dumps(data, ensure_ascii=False, separators=(',', ':')).encode()
                 start = dict(state['start'])
                 start['headers'] = [(k,v) for k,v in start.get('headers', []) if k.lower() not in (b'content-length', b'content-type', b'etag', b'content-encoding')]
                 if count:
@@ -94,8 +103,6 @@ class PakkuOutputMiddleware:
                                          (b'x-pakku-recent-available', str(ctx.stats.get('availableCount', 0)).encode()),
                                          (b'x-pakku-recent-partial', b'1' if ctx.stats.get('partial') else b'0')]
                 start['headers'] += [(b'content-length', str(len(body)).encode()), (b'content-type', content_type)]
-                await send(start)
-                await send({'type':'http.response.body','body':body,'more_body':False})
             except RecentUnavailable as exc:
                 body = json.dumps({'success': False, 'detail': str(exc), 'count': 0, 'comments': []}, ensure_ascii=False).encode()
                 start = dict(state['start'])
@@ -103,14 +110,10 @@ class PakkuOutputMiddleware:
                 start['headers'] = [(k, v) for k, v in start.get('headers', [])
                                     if k.lower() not in (b'content-length', b'content-type', b'content-encoding', b'etag')]
                 start['headers'] += [(b'content-type', b'application/json'), (b'content-length', str(len(body)).encode())]
-                await send(start)
-                await send({'type': 'http.response.body', 'body': body, 'more_body': False})
             except Exception:
                 # Includes an unavailable merge engine; native responses remain usable.
-                await send(state['start'])
-                await send({'type':'http.response.body','body':raw,'more_body':False})
+                start, body = state['start'], raw
+            await send(start)
+            await send({'type': 'http.response.body', 'body': body, 'more_body': False})
 
-        try:
-            await self.app(scope, receive, intercept)
-        finally:
-            recent_request.reset(context_token)
+        await self.app(scope, receive, intercept)

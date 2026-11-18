@@ -164,75 +164,27 @@ class ScopedHookTests(unittest.IsolatedAsyncioTestCase):
         for provider_name in ('dandanplay', 'ezdmw', 'other'):
             provider = recent.RecentCommentProvider()
             provider._cached = AsyncMock()
-            row = types.SimpleNamespace(providerName=provider_name)
-            session = types.SimpleNamespace(execute=AsyncMock(return_value=types.SimpleNamespace(first=lambda: row)))
-            rows, info = await provider.comments(session, 123, 5000, None)
+            db = types.SimpleNamespace(episode=types.SimpleNamespace(
+                get_episode_provider_info=AsyncMock(return_value={'providerName': provider_name})))
+            rows, info = await provider.comments(db, 123, 5000, None)
             self.assertIsNone(rows)
             self.assertEqual(info['selectionMode'], 'all')
             provider._cached.assert_not_awaited()
 
-    async def test_non_bilibili_keeps_native_reader_and_sampling_cache(self):
-        rows = [{'m': 'all source comments without dates'}]
-        old = AsyncMock(return_value=rows)
-        old_set = AsyncMock()
-        crud = types.SimpleNamespace(fetch_comments=old, fetch_merged_comments=old)
-        native = types.SimpleNamespace(__name__='src.api.dandan.comments',
-                 get_db_cache=AsyncMock(return_value='native cache'),
-                 set_db_cache=old_set, SAMPLED_COMMENTS_CACHE_PREFIX='sampled')
-        async def endpoint():
-            result = await crud.fetch_comments(None, 123)
-            cached = await native.get_db_cache(None, 'sampled', 'key')
-            await native.set_db_cache(None, 'sampled', 'key', {})
-            return result, cached
-        endpoint.__module__ = native.__name__
-        route = types.SimpleNamespace(dependant=types.SimpleNamespace(call=endpoint))
-        provider = recent.RecentCommentProvider()
-        provider.comments = AsyncMock(return_value=(None, {'selectionMode': 'all'}))
-        db = types.ModuleType('src.db'); db.crud = crud
-        with patch.dict(sys.modules, {'src.db': db}), patch.object(recent.importlib, 'import_module', return_value=native):
-            provider.install(types.SimpleNamespace(routes=[route]))
-        ctx = recent.RecentRequest(None, 5000)
-        token = recent.recent_request.set(ctx)
-        try:
-            result, cached = await asyncio.create_task(route.dependant.call())
-            self.assertEqual(result, rows)
-            self.assertEqual(cached, 'native cache')
-            self.assertFalse(ctx.applied)
-            old_set.assert_awaited_once()
-        finally:
-            recent.recent_request.reset(token)
-
-    async def test_endpoint_child_task_uses_recent_background_and_nonplayer_do_not(self):
-        old = AsyncMock(return_value=[{'m': 'historical'}])
-        old_set = AsyncMock()
-        crud = types.SimpleNamespace(fetch_comments=old, fetch_merged_comments=old)
-        native = types.SimpleNamespace(__name__='src.api.dandan.comments',
-                 get_db_cache=AsyncMock(return_value='historical cache'),
-                 set_db_cache=old_set, SAMPLED_COMMENTS_CACHE_PREFIX='sampled')
-        async def endpoint():
-            selected = await crud.fetch_comments(None, 123)
-            background = await asyncio.create_task(crud.fetch_comments(None, 123))
-            cached = await native.get_db_cache(None, 'sampled', 'key')
-            await native.set_db_cache(None, 'sampled', 'key', {})
-            return selected, background, cached
-        endpoint.__module__ = native.__name__
-        route = types.SimpleNamespace(dependant=types.SimpleNamespace(call=endpoint))
+    async def test_reader_only_substitutes_dated_bilibili_rows_for_this_request(self):
+        native = AsyncMock(return_value=[{'m': 'historical'}])
         provider = recent.RecentCommentProvider()
         provider.comments = AsyncMock(return_value=([{'m': 'recent'}], {'selectedCount': 1}))
-        db = types.ModuleType('src.db'); db.crud = crud
-        with patch.dict(sys.modules, {'src.db': db}), patch.object(recent.importlib, 'import_module', return_value=native):
-            provider.install(types.SimpleNamespace(routes=[route]))
-        ctx = recent.RecentRequest(None, 3000)
-        token = recent.recent_request.set(ctx)
-        try:
-            selected, background, cached = await asyncio.create_task(route.dependant.call())
-            self.assertEqual(selected, [{'m': 'recent'}])
-            self.assertEqual(background, [{'m': 'historical'}])
-            self.assertIsNone(cached)
-            old_set.assert_not_awaited()
-        finally:
-            recent.recent_request.reset(token)
-        self.assertEqual(await crud.fetch_comments(None, 123), [{'m': 'historical'}])
+        ctx = recent.RecentRequest(None, 1000)
+        rows = await provider.read_for_player(None, 123, native, ctx)
+        self.assertTrue(ctx.applied)
+        self.assertEqual(rows, [{'m': 'recent'}])
+        native.assert_not_awaited()
+        provider.comments.return_value = (None, {'selectionMode': 'all'})
+        second = recent.RecentRequest(None, 1000)
+        self.assertEqual(await provider.read_for_player(None, 123, native, second), [{'m': 'historical'}])
+        self.assertFalse(second.applied)
+        native.assert_awaited_once_with(123)
 
 
 if __name__ == '__main__':

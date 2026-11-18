@@ -65,8 +65,15 @@ async def get_comments_for_dandan(
     await wait_for_refresh_task(episodeId, task_manager, max_wait_seconds=15.0)
     async with database_service.transaction():
         session = database_service._session
-        danmaku_service = DanmakuService(database_service)
-        comments_data = await danmaku_service.fetch_comments(episodeId)
+        native_reader = DanmakuService(database_service).fetch_comments
+        # 可选的请求级输入扩展；后备下载及普通库读取继续使用上游服务。
+        reader = getattr(request.state, "player_comment_reader", None)
+        async def read_comments(episode_id: int):
+            if reader is None:
+                return await native_reader(episode_id)
+            return await reader(database_service, episode_id, native_reader)
+
+        comments_data = await read_comments(episodeId)
         if comments_data:
             try:
                 episode = await database_service.episode.get_by_id(episodeId)
@@ -90,7 +97,7 @@ async def get_comments_for_dandan(
                 await asyncio.wait_for(event.wait(), timeout=30.0)
             except asyncio.TimeoutError:
                 return DandanCommentsResponse(count=0, comments=[])
-            comments_data = await danmaku_service.fetch_comments(episodeId)
+            comments_data = await read_comments(episodeId)
             if comments_data:
                 return await process_output(
                     comments_data, episodeId, token, chConvert, session, config_service

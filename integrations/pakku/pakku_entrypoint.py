@@ -8,7 +8,6 @@ from pakku_gateway import PakkuOutputMiddleware
 from src.core.pakku_recent import RecentCommentProvider
 
 app.state.pakku_recent_provider = RecentCommentProvider()
-app.state.pakku_recent_provider.install(app)
 app.include_router(router, prefix='/api/ui', include_in_schema=False)
 app.add_middleware(PakkuOutputMiddleware, owner_app=app)
 
