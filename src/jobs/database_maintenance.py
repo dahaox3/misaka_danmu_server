@@ -1,58 +1,109 @@
 import asyncio
 import logging
+import re
 from typing import Callable, Optional
-from datetime import timedelta
-from pathlib import Path
+from datetime import datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy import text, select
 
-from src.db import crud, orm_models, _get_db_url
-from src.core import settings, get_now
+from src.db import orm_models, _get_db_url
+from src.core import settings, get_now, get_app_timezone
 from .base import BaseJob
-from src.services import TaskSuccess
-from src.utils.task_profiler import profile_flow, FLOW_DATABASE_MAINTENANCE
+from src.utils.diagnostics.task_exceptions import TaskSuccess
+from src.services.file_storage_service import CONFIG_DIR, get_file_storage_service
+from src.services.service_container import get_database_service
+from src.services.performance_service import profile_flow
+from src.schemas.performance import FLOW_DATABASE_MAINTENANCE
 
 logger = logging.getLogger(__name__)
 
-# 图片存储目录
-IMAGE_DIR = Path("/app/config/image")
+# 与图片存储共用配置根目录，兼容源码运行环境和 Docker，避免硬编码 /app。
+IMAGE_DIR = CONFIG_DIR / "image"
 
-async def _clean_orphaned_images(session: AsyncSession) -> str:
-    """清理数据库中不存在的图片文件"""
+# 通知/检索生成的公开缩略图（w{宽度}_{哈希}.webp/.jpg）不登记在数据库中，
+# 已发出的通知仍会引用它们，因此只清理超过保留期的缩略图，不按"未引用"立即删除。
+_THUMBNAIL_NAME_RE = re.compile(r"^w\d+_[0-9a-f]{16}\.(webp|jpg)$")
+_THUMBNAIL_RETENTION = timedelta(days=30)
+# 非关联孤立图片的默认保留天数（任务配置 orphanImageRetentionDays 未设置或非法时使用）
+DEFAULT_ORPHAN_IMAGE_RETENTION_DAYS = 7
+
+# 所有可能保存本地缓存图片（/data/images/...）的列；漏列任意一列都会把仍在使用的图片误删。
+_IMAGE_REFERENCE_COLUMNS = (
+    orm_models.Anime.localImagePath,
+    orm_models.Anime.imageUrl,
+    orm_models.MediaItem.posterUrl,
+    orm_models.LocalDanmakuItem.posterUrl,
+    orm_models.ExternalCalendarItem.imageUrl,
+)
+
+
+async def _clean_orphaned_images(
+    session: AsyncSession, orphan_retention_days: int = DEFAULT_ORPHAN_IMAGE_RETENTION_DAYS,
+) -> str:
+    """清理数据库中不存在引用的图片文件。
+
+    非关联孤立图片超过 orphan_retention_days 天（按文件修改时间）才删除，0 表示立即删除；
+    公开缩略图固定按 30 天保留期清理。
+    """
     if not IMAGE_DIR.exists():
-        return "图片目录不存在，跳过清理。"
+        return f"图片目录不存在（{IMAGE_DIR.resolve()}），跳过清理。"
 
-    # 获取数据库中所有的图片路径
-    stmt = select(orm_models.Anime.localImagePath).where(orm_models.Anime.localImagePath.isnot(None))
-    result = await session.execute(stmt)
+    image_dir = IMAGE_DIR.resolve()
+    storage = get_file_storage_service()
     db_image_paths = set()
+    reference_count = 0
+    for column in _IMAGE_REFERENCE_COLUMNS:
+        result = await session.execute(select(column).where(column.isnot(None)))
+        for stored_path in result.scalars().all():
+            # 远程 URL 不对应本地文件，直接忽略；其余统一走 resolve_fs_path 解析历史格式。
+            if not stored_path or stored_path.startswith(("http://", "https://")):
+                continue
+            reference_count += 1
+            resolved_path = storage.resolve_fs_path(stored_path)
+            if resolved_path is None:
+                continue
+            try:
+                if resolved_path.resolve().parent == image_dir:
+                    db_image_paths.add(resolved_path.name)
+            except OSError:
+                logger.warning("图片引用路径解析失败，跳过: %s", stored_path)
 
-    for row in result.scalars().all():
-        if row and row.startswith('/data/images/'):
-            # 提取文件名
-            filename = row.split('/')[-1]
-            db_image_paths.add(filename)
+    # 安全阀：存在本地图片引用却一个都没解析进图片目录，说明路径映射有问题，宁可不删也不整批误删。
+    if reference_count and not db_image_paths:
+        logger.error("图片清理中止：数据库有 %d 条本地图片引用，但均未解析到 %s", reference_count, image_dir)
+        return f"图片缓存清理已中止：{reference_count} 条引用均未能解析到图片目录，请检查路径映射。"
 
-    # 获取文件系统中的所有图片文件
-    fs_image_files = set()
+    # 统一使用应用时区时间工具；文件 mtime 同样换算到应用时区后再比较，避免混用两套时间口径。
+    now = get_now()
+    thumbnail_cutoff = now - _THUMBNAIL_RETENTION
+    orphan_cutoff = now - timedelta(days=orphan_retention_days)
+    app_tz = get_app_timezone()
+    orphaned_files = []
     for file_path in IMAGE_DIR.iterdir():
-        if file_path.is_file() and file_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']:
-            fs_image_files.add(file_path.name)
-
-    # 找出孤立的图片文件（文件系统中存在但数据库中不存在）
-    orphaned_files = fs_image_files - db_image_paths
+        if not file_path.is_file() or file_path.suffix.lower() not in ('.jpg', '.jpeg', '.png', '.webp'):
+            continue
+        if file_path.name in db_image_paths:
+            continue
+        # 缩略图与普通孤立图片分别按各自保留期判断，未到期的文件本轮保留。
+        cutoff = thumbnail_cutoff if _THUMBNAIL_NAME_RE.match(file_path.name) else orphan_cutoff
+        try:
+            modified_at = datetime.fromtimestamp(file_path.stat().st_mtime, app_tz).replace(tzinfo=None)
+        except OSError:
+            continue
+        if modified_at > cutoff:
+            continue
+        orphaned_files.append(file_path)
 
     deleted_count = 0
-    for filename in orphaned_files:
+    for file_path in orphaned_files:
         try:
-            file_path = IMAGE_DIR / filename
             file_path.unlink()
             deleted_count += 1
             logger.debug(f"删除孤立图片文件: {file_path}")
         except Exception as e:
-            logger.error(f"删除图片文件失败 {filename}: {e}")
+            logger.error(f"删除图片文件失败 {file_path.name}: {e}")
 
     return f"图片缓存清理完成，删除了 {deleted_count} 个孤立文件。"
 
@@ -112,8 +163,27 @@ class DatabaseMaintenanceJob(BaseJob):
     description_en = "Periodically clean expired logs, optimize database tables, and clean invalid image caches. Helps maintain performance and save storage."
     description_tw = "定期清理過期的應用日誌、最佳化資料庫表、清理無效的圖片快取檔案。幫助保持系統效能和節省儲存空間。"
 
+    config_schema = [
+        {
+            "key": "orphanImageRetentionDays",
+            "label": "孤立图片保留天数",
+            "label_en": "Orphan Image Retention Days",
+            "label_tw": "孤立圖片保留天數",
+            "type": "number",
+            "default": DEFAULT_ORPHAN_IMAGE_RETENTION_DAYS,
+            "min": 0,
+            "max": 3650,
+            "suffix": "天",
+            "suffix_en": "days",
+            "suffix_tw": "天",
+            "description": "未被任何作品或媒体项引用的缓存图片，修改时间超过该天数后才会删除；0 表示立即删除。默认 7 天。",
+            "description_en": "Cached images not referenced by any item are deleted only after this many days since modification; 0 deletes immediately. Default 7 days.",
+            "description_tw": "未被任何作品或媒體項引用的快取圖片，修改時間超過該天數後才會刪除；0 表示立即刪除。預設 7 天。",
+        }
+    ]
+
     @profile_flow(FLOW_DATABASE_MAINTENANCE)
-    async def run(self, session: AsyncSession, progress_callback: Callable):
+    async def run(self, session: AsyncSession, progress_callback: Callable, task_config: Optional[dict] = None):
         """
         执行缓存日志清理任务：清理旧日志、优化表和清理无效图片缓存。
         """
@@ -122,9 +192,11 @@ class DatabaseMaintenanceJob(BaseJob):
         # --- 1. 应用日志清理 ---
         await progress_callback(10, "正在清理旧日志...")
 
+        db = get_database_service()
         try:
-            # 日志保留天数，默认为30天。
-            retention_days_str = await crud.get_config_value(session, "logRetentionDays", "30")
+            # 配置读取使用短事务，避免连接被后续维护操作长期占用。
+            async with db.transaction():
+                retention_days_str = await db.config.get_value("logRetentionDays", "30")
             retention_days = int(retention_days_str)
         except (ValueError, TypeError):
             retention_days = 30
@@ -141,16 +213,13 @@ class DatabaseMaintenanceJob(BaseJob):
 
             total_deleted = 0
             for name, (model, date_column) in tables_to_prune.items():
-                deleted_count: Optional[int] = await crud.prune_logs(session, model, date_column, cutoff_date)
+                # 每张表独立提交并释放行锁，避免阻塞任务进度更新和新任务创建。
+                async with db.transaction():
+                    deleted_count: Optional[int] = await db.utility.prune_logs(model, date_column, cutoff_date)
 
-                # 修正：增加对 deleted_count 的 None 值检查，以提高代码的健壮性。
-                # 这可以防止当底层数据库操作（如某些驱动下的DELETE）不返回行数时，任务意外失败。
+                # 某些驱动的 DELETE 不返回行数，此时按零计数。
                 if deleted_count is None:
                     deleted_count = 0
-
-                # 关键修复：每个表 DELETE 后立即 commit，释放行锁。
-                # 避免批量 DELETE task_history 的行锁长时间持有，阻塞其他任务的进度更新和新任务创建。
-                await session.commit()
 
                 if deleted_count > 0:
                     self.logger.info(f"从 {name} 表中删除了 {deleted_count} 条旧记录。")
@@ -165,8 +234,9 @@ class DatabaseMaintenanceJob(BaseJob):
         if db_type == "mysql":
             await progress_callback(50, "正在清理 MySQL Binlog...")
             try:
-                # 新增：从配置中读取binlog保留天数
-                binlog_retention_days_str = await crud.get_config_value(session, "mysqlBinlogRetentionDays", "3")
+                # 配置访问必须绑定事务，读取结束后再执行独立的 Binlog 维护。
+                async with db.transaction():
+                    binlog_retention_days_str = await db.config.get_value("mysqlBinlogRetentionDays", "3")
                 binlog_retention_days = int(binlog_retention_days_str)
 
                 if binlog_retention_days > 0:
@@ -215,13 +285,21 @@ class DatabaseMaintenanceJob(BaseJob):
 
         # --- 4. 图片缓存清理（带重试，防止长时间任务导致连接断开）---
         await progress_callback(85, "正在清理无效图片缓存...")
+        # 读取任务配置中的孤立图片保留天数，非法值回退默认 7 天
+        try:
+            orphan_retention_days = int((task_config or {}).get(
+                "orphanImageRetentionDays", DEFAULT_ORPHAN_IMAGE_RETENTION_DAYS))
+        except (TypeError, ValueError):
+            orphan_retention_days = DEFAULT_ORPHAN_IMAGE_RETENTION_DAYS
+        if orphan_retention_days < 0:
+            orphan_retention_days = DEFAULT_ORPHAN_IMAGE_RETENTION_DAYS
 
         image_cleanup_message = ""
         max_retries = 2
         for attempt in range(max_retries + 1):
             try:
                 image_cleanup_message = await asyncio.wait_for(
-                    _clean_orphaned_images(session), timeout=180  # 3 分钟超时
+                    _clean_orphaned_images(session, orphan_retention_days), timeout=180  # 3 分钟超时
                 )
                 self.logger.info(f"图片缓存清理结果: {image_cleanup_message}")
                 break

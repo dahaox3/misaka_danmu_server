@@ -1,0 +1,961 @@
+import asyncio
+import logging
+import re
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from src.schemas import MetadataDetailsResponse, ProviderSearchInfo, User
+from src.utils import normalize_title, parse_search_keyword
+# 别名提取只依赖纯工具，不加载业务编排及其服务依赖。
+from src.utils.data_processing.alias_utils import extract_aliases_from_details
+from src.workflows.alias_workflow import validate_aliases_with_ai
+from src.workflows.image_download import download_image, is_local_poster_broken
+from .base import BaseJob
+# 任务成功信号需在运行时 raise，必须真实导入（不可放入 TYPE_CHECKING）
+from src.services.task_manager import TaskSuccess
+from src.services.ai_service import AIService
+from src.services.service_container import get_database_service
+from src.ai.ai_prompts import DEFAULT_AI_MATCH_PROMPT, DEFAULT_AI_RECOGNITION_PROMPT, DEFAULT_AI_ALIAS_VALIDATION_PROMPT
+from src.services.performance_service import profile_flow
+from src.schemas.media_types import (
+    MEDIA_TYPE_MOVIE, MEDIA_TYPE_SHORT_DRAMA, MEDIA_TYPE_VARIETY,
+    SERIES_TYPES, is_movie_type, is_series_type,
+)
+from src.schemas.performance import FLOW_AUTO_SCRAPE
+
+if TYPE_CHECKING:
+    from src.services.metadata_service import MetadataService
+    from src.services.task_manager import TaskManager
+    from src.services.ai_service import AIService
+
+# 参与自动刮削的作品类型：剧集形态（含综艺/短剧）+ 电影；OVA/其他 在 TMDB 上命中率低，仍不处理
+AUTO_SCRAPE_TYPES: List[str] = sorted(SERIES_TYPES | {MEDIA_TYPE_MOVIE})
+# TMDB 无结果时的动画类兜底源（按顺序尝试）；综艺/短剧不在这两个动画库中，不做兜底
+FALLBACK_PROVIDERS: Tuple[str, ...] = ("bangumi", "anilist")
+NO_FALLBACK_TYPES = frozenset({MEDIA_TYPE_VARIETY, MEDIA_TYPE_SHORT_DRAMA})
+DEFAULT_PRIMARY_PROVIDER = "tmdb"
+# 逐字段写入策略：仅补缺 / 覆盖 / 跳过
+FIELD_MODES: Tuple[str, ...] = ("fill", "overwrite", "skip")
+FIELD_MODE_OPTIONS = [
+    {"value": "fill", "label": "仅补缺", "label_en": "Fill empty", "label_tw": "僅補缺"},
+    {"value": "overwrite", "label": "覆盖", "label_en": "Overwrite", "label_tw": "覆蓋"},
+    {"value": "skip", "label": "跳过", "label_en": "Skip", "label_tw": "跳過"},
+]
+# 元数据源显示名；未列出的源直接显示 provider 名
+PROVIDER_LABELS: Dict[str, str] = {
+    "tmdb": "TMDB", "bangumi": "Bangumi", "anilist": "AniList", "douban": "豆瓣",
+    "imdb": "IMDb", "tvdb": "TVDB", "trakt": "Trakt", "360": "360", "anibt": "AniBT",
+}
+# 详情里各源 ID 字段 → update_metadata_if_empty 关键字参数
+_PROVIDER_ID_FIELDS: Dict[str, Tuple[str, str]] = {
+    "tmdb": ("tmdbId", "tmdb_id"), "imdb": ("imdbId", "imdb_id"), "tvdb": ("tvdbId", "tvdb_id"),
+    "douban": ("doubanId", "douban_id"), "bangumi": ("bangumiId", "bangumi_id"),
+}
+
+
+class AutoScrapeJob(BaseJob):
+    # 新任务类型：刮削已不限于 TMDB（含 Bangumi/AniList 兜底），旧类型 tmdbAutoScrape 由迁移 remove_tmdb_auto_scrape_task_v1 清理
+    job_type = "autoScrape"
+    job_name = "自动刮削与剧集组映射"
+    job_name_en = "Auto-Scrape & Episode Group Mapping"
+    job_name_tw = "自動刮削與劇集組對映"
+    description = "自动为已导入作品刮削别名、海报、年份与剧集组信息（优先 TMDB，无结果时用 Bangumi / AniList 兜底），更新分集映射关系。"
+    description_en = "Auto-scrape aliases, poster, year and episode groups for imported works (TMDB first, Bangumi / AniList as fallback), updating episode mappings."
+    description_tw = "自動為已匯入作品刮削別名、海報、年份與劇集組資訊（優先 TMDB，無結果時以 Bangumi / AniList 兜底），更新分集對映關係。"
+    config_schema = [
+        {
+            "key": "forceScrape",
+            "label": "强制刮削",
+            "label_en": "Force Scrape",
+            "label_tw": "強制刮削",
+            "type": "boolean",
+            "description": "关闭时，已有剧集组映射的条目将被跳过；开启时，强制覆盖所有条目的刮削数据",
+            "description_en": "When off, entries with existing episode group mappings are skipped; when on, force overwrite all entries.",
+            "description_tw": "關閉時，已有劇集組對映的條目將被跳過；開啟時，強制覆蓋所有條目的刮削資料",
+            "default": False,
+        },
+        {
+            "key": "enableEpisodeGroup",
+            "label": "剧集组刮削",
+            "label_en": "Episode Group Scraping",
+            "label_tw": "劇集組刮削",
+            "type": "boolean",
+            "description": "开启后将从TMDB获取剧集组信息并更新分集映射关系；关闭时仅刮削别名信息",
+            "description_en": "When enabled, fetches episode group info from TMDB and updates mappings; when disabled, only scrapes alias info.",
+            "description_tw": "開啟後將從TMDB取得劇集組資訊並更新分集對映關係；關閉時僅刮削別名資訊",
+            "default": False,
+        },
+        {
+            "key": "primaryProvider",
+            "label": "主刮削源",
+            "label_en": "Primary Source",
+            "label_tw": "主刮削源",
+            "type": "select",
+            "optionsSource": "metadataSources",
+            "options": [{"value": "tmdb", "label": "TMDB"}],
+            "description": "优先使用的元数据源（选项为当前已加载的全部元数据源）；剧集组映射仅 TMDB 支持",
+            "description_en": "Metadata source tried first (options are all loaded sources); episode group mapping is TMDB-only.",
+            "description_tw": "優先使用的元資料源（選項為目前已載入的全部元資料源）；劇集組對映僅 TMDB 支援",
+            "default": DEFAULT_PRIMARY_PROVIDER,
+        },
+        {
+            "key": "fallbackEnabled",
+            "label": "兜底刮削",
+            "label_en": "Fallback Scraping",
+            "label_tw": "兜底刮削",
+            "type": "boolean",
+            "description": "主刮削源无结果时，按顺序尝试兜底源补全别名/海报/年份（综艺、短剧不兜底）",
+            "description_en": "When the primary source finds nothing, try fallback sources in order (not for variety/short drama).",
+            "description_tw": "主刮削源無結果時，依序嘗試兜底源補全別名/海報/年份（綜藝、短劇不兜底）",
+            "default": True,
+        },
+        {
+            "key": "fallbackProviders",
+            "label": "兜底源（按顺序）",
+            "label_en": "Fallback Sources (in order)",
+            "label_tw": "兜底源（依序）",
+            "type": "multiselect",
+            "optionsSource": "metadataSources",
+            "options": [{"value": "bangumi", "label": "Bangumi"}, {"value": "anilist", "label": "AniList"}],
+            "description": "选择顺序即尝试顺序；与主刮削源相同的源会被忽略",
+            "description_en": "Selection order is the try order; the primary source is ignored here.",
+            "description_tw": "選擇順序即嘗試順序；與主刮削源相同的源會被忽略",
+            "default": list(FALLBACK_PROVIDERS),
+        },
+        {
+            "key": "aliasMode",
+            "label": "别名写入",
+            "label_en": "Aliases",
+            "label_tw": "別名寫入",
+            "type": "segmented",
+            "options": FIELD_MODE_OPTIONS,
+            "description": "仅补缺：只填空字段；覆盖：用刮削结果替换（仍尊重别名锁定）；跳过：不写别名",
+            "description_en": "Fill empty / overwrite (alias lock respected) / skip.",
+            "description_tw": "僅補缺：只填空欄位；覆蓋：以刮削結果取代（仍尊重別名鎖定）；跳過：不寫別名",
+            "default": "fill",
+        },
+        {
+            "key": "posterMode",
+            "label": "海报写入",
+            "label_en": "Poster",
+            "label_tw": "海報寫入",
+            "type": "segmented",
+            "options": FIELD_MODE_OPTIONS,
+            "description": "仅补缺：只在无海报或破图时写入；覆盖：用刮削结果替换；跳过：不改海报",
+            "description_en": "Fill when empty or broken / overwrite / skip.",
+            "description_tw": "僅補缺：只在無海報或破圖時寫入；覆蓋：以刮削結果取代；跳過：不改海報",
+            "default": "fill",
+        },
+        {
+            "key": "yearMode",
+            "label": "年份写入",
+            "label_en": "Year",
+            "label_tw": "年份寫入",
+            "type": "segmented",
+            "options": FIELD_MODE_OPTIONS,
+            "description": "仅补缺 / 覆盖 / 跳过",
+            "description_en": "Fill empty / overwrite / skip.",
+            "description_tw": "僅補缺 / 覆蓋 / 跳過",
+            "default": "fill",
+        },
+        {
+            "key": "brokenImageCheck",
+            "label": "破图检测与补充",
+            "label_en": "Broken Poster Repair",
+            "label_tw": "破圖檢測與補充",
+            "type": "boolean",
+            "description": "检查本地海报文件是否缺失或无法解码；破图视为无海报，重新刮削补充（增量模式也不会跳过）",
+            "description_en": "Detect missing/undecodable local posters and re-fill them (not skipped in incremental mode).",
+            "description_tw": "檢查本地海報檔是否遺失或無法解碼；破圖視為無海報並重新刮削補充（增量模式也不會略過）",
+            "default": True,
+        },
+        {
+            "key": "localizePoster",
+            "label": "海报本地化",
+            "label_en": "Cache Poster Locally",
+            "label_tw": "海報本地化",
+            "type": "boolean",
+            "description": "写入新海报时同时下载到本地缓存（/data/images），避免远程图失效",
+            "description_en": "Download newly written posters to local cache (/data/images).",
+            "description_tw": "寫入新海報時同時下載到本地快取（/data/images），避免遠端圖失效",
+            "default": False,
+        },
+    ]
+
+    @classmethod
+    def build_config_schema(cls, metadata_manager: Any) -> List[Dict[str, Any]]:
+        """按当前已加载（且启用）的元数据源生成源选择项；有多少个源就给多少个选项。"""
+        sources = list(getattr(metadata_manager, "sources", {}) or {})
+        settings = getattr(metadata_manager, "source_settings", {}) or {}
+        enabled = [p for p in sources if settings.get(p, {}).get("isEnabled", True)]
+        # TMDB 固定在最前，其余按源设置的 displayOrder
+        enabled.sort(key=lambda p: (p != DEFAULT_PRIMARY_PROVIDER, settings.get(p, {}).get("displayOrder", 999), p))
+        options = [{"value": p, "label": PROVIDER_LABELS.get(p, p)} for p in enabled]
+        schema = []
+        for item in cls.config_schema:
+            if item.get("optionsSource") == "metadataSources" and options:
+                item = {**item, "options": options}
+            schema.append(item)
+        return schema
+
+    @staticmethod
+    def _parse_options(task_config: Dict[str, Any]) -> Dict[str, Any]:
+        """读取任务配置并做容错：旧任务没有新字段时取默认值（与原行为一致）。"""
+        def mode(key: str) -> str:
+            value = task_config.get(key, "fill")
+            return value if value in FIELD_MODES else "fill"
+        fallbacks = task_config.get("fallbackProviders")
+        if not isinstance(fallbacks, list):
+            fallbacks = list(FALLBACK_PROVIDERS)
+        primary = task_config.get("primaryProvider") or DEFAULT_PRIMARY_PROVIDER
+        return {
+            "primary": primary,
+            "fallback_enabled": bool(task_config.get("fallbackEnabled", True)),
+            "fallbacks": [p for p in fallbacks if isinstance(p, str) and p != primary],
+            "alias_mode": mode("aliasMode"),
+            "poster_mode": mode("posterMode"),
+            "year_mode": mode("yearMode"),
+            "broken_check": bool(task_config.get("brokenImageCheck", True)),
+            "localize": bool(task_config.get("localizePoster", False)),
+        }
+
+    async def _write_aliases(
+        self, db: Any, session: AsyncSession, anime_id: int, aliases: Optional[Dict[str, Any]],
+        force_update: bool, opts: Dict[str, Any],
+    ) -> List[str]:
+        """按别名策略写入：跳过不写；覆盖模式强制替换但尊重别名锁定；AI 修正沿用原有强制语义。"""
+        if opts["alias_mode"] == "skip" or not aliases or not any(aliases.values()):
+            return []
+        overwrite = opts["alias_mode"] == "overwrite"
+        async with db.transaction(session=session):
+            return await db.anime.update_aliases_if_empty(
+                anime_id, aliases, force_update=force_update or overwrite,
+                respect_lock=overwrite and not force_update,
+            )
+
+    async def _write_basic(
+        self, db: Any, session: AsyncSession, anime_id: int, details: MetadataDetailsResponse,
+        provider: str, opts: Dict[str, Any], image_broken: bool,
+    ) -> List[str]:
+        """按海报/年份策略写入；需要本地化时先下载（网络 I/O 不占用事务）。"""
+        image_url = details.imageUrl if opts["poster_mode"] != "skip" else None
+        local_path = None
+        if image_url and opts["localize"]:
+            local_path = await download_image(image_url, provider)
+            if not local_path:
+                self.logger.warning(f"作品 {anime_id} 海报本地化失败，仅写入远程地址: {image_url}")
+        async with db.transaction(session=session):
+            return await db.anime.apply_basic_info(
+                anime_id, image_url=image_url,
+                year=details.year if opts["year_mode"] != "skip" else None,
+                image_mode=opts["poster_mode"], year_mode=opts["year_mode"],
+                image_broken=image_broken, local_image_path=local_path,
+            )
+
+    # 修正：此任务不涉及弹幕下载，因此移除不必要的 rate_limiter 依赖
+    # 修正：接收正确的依赖项
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], task_manager: "TaskManager", metadata_manager: "MetadataService", ai_service: AIService) -> None:
+        # 仅接收作业所需依赖，AI 客户端由全局服务统一维护。
+        self._session_factory = session_factory
+        self.task_manager = task_manager
+        self.metadata_manager = metadata_manager
+        self.ai_service = ai_service
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+
+    @staticmethod
+    def _title_key(text: Optional[str]) -> str:
+        """标题比较键：去季度后缀、空白与常见标点，统一小写。"""
+        base = normalize_title(text or "")
+        return re.sub(r"[\s\-_:：·・,，.。!！?？'\"“”‘’()（）\[\]【】]+", "", base).lower()
+
+    async def _is_stored_tmdb_id_plausible(
+        self, tmdb_id: str, title: str, year: Optional[int], search_type: str, user: User,
+    ) -> bool:
+        """已存 TMDB ID 是否可信：标题（含别名）对上，或年份对上，即视为可信。
+
+        取不到详情（ID 不存在或类型不对）视为不可信；网络等异常时保守视为可信，避免误改。
+        """
+        media_type = "movie" if is_movie_type(search_type) else "tv"
+        try:
+            details = await self.metadata_manager.get_details("tmdb", tmdb_id, user, mediaType=media_type)
+        except Exception as e:
+            self.logger.warning(f"校验 TMDB ID {tmdb_id} 时获取详情失败，保留原 ID: {e}")
+            return True
+        if not details:
+            return False
+
+        local_key = self._title_key(title)
+        candidates = [details.title, details.nameEn, details.nameJp, details.nameRomaji,
+                      *(details.aliasesCn or []), *(details.aliasesJp or [])]
+        for name in candidates:
+            key = self._title_key(name)
+            if local_key and key and (local_key in key or key in local_key):
+                return True
+
+        if year and details.year:
+            try:
+                return abs(int(year) - int(details.year)) <= 1
+            except (TypeError, ValueError):
+                return True
+        # 没有年份可比时，仅凭标题不符判错
+        return False
+
+    def _pick_fallback_match(
+        self, results: List[MetadataDetailsResponse], title: str, year: Optional[int],
+    ) -> Optional[MetadataDetailsResponse]:
+        """从兜底源结果里挑一个标题对得上的条目；对不上就放弃，宁缺毋滥避免写错别名。"""
+        local_key = self._title_key(title)
+        if not local_key:
+            return None
+        matched: List[MetadataDetailsResponse] = []
+        for r in results:
+            names = [r.title, r.nameEn, r.nameJp, r.nameRomaji, *(r.aliasesCn or []), *(r.aliasesJp or [])]
+            if any(self._title_key(n) == local_key for n in names if n):
+                matched.append(r)
+        if not matched:
+            return None
+        if year:
+            for r in matched:
+                if r.year and abs(int(r.year) - int(year)) <= 1:
+                    return r
+        return matched[0]
+
+    async def _scrape_from_fallback(
+        self, db: Any, session: AsyncSession, anime_id: int, title: str, year: Optional[int],
+        search_title: str, search_type: str, user: User,
+        opts: Optional[Dict[str, Any]] = None, image_broken: bool = False,
+        providers: Optional[List[str]] = None, strict: bool = True,
+    ) -> Optional[str]:
+        """按顺序用给定源补别名、海报、年份与该源 ID（不做剧集组）。
+
+        providers 缺省为兜底源列表；strict=True 时标题必须对上（兜底宁缺毋滥），
+        作为非 TMDB 主源时 strict=False，标题对不上则取年份相符或首个结果。
+
+        Returns:
+            命中的源名称；都未命中返回 None
+        """
+        opts = opts or self._parse_options({})
+        media_type = "movie" if is_movie_type(search_type) else "tv"
+        for provider in (providers if providers is not None else opts["fallbacks"]):
+            try:
+                results = await self.metadata_manager.search(provider, search_title, user, mediaType=media_type)
+            except Exception as e:
+                # 源未启用（404）或网络异常都只跳到下一个源
+                self.logger.info(f"兜底源 {provider} 搜索 '{search_title}' 不可用: {e}")
+                continue
+            results = results or []
+            match = self._pick_fallback_match(results, search_title, year) \
+                or self._pick_fallback_match(results, title, year)
+            if not match and not strict and results:
+                match = next((r for r in results if year and r.year == year), results[0])
+            if not match:
+                continue
+            details = await self.metadata_manager.get_details(provider, match.id, user, mediaType=media_type) or match
+            updated: List[str] = []
+            updated += await self._write_aliases(
+                db, session, anime_id, extract_aliases_from_details(details), False, opts
+            )
+            updated += await self._write_basic(db, session, anime_id, details, provider, opts, image_broken)
+            id_fields: Dict[str, str] = {}
+            for name, (attr, kwarg) in _PROVIDER_ID_FIELDS.items():
+                value = getattr(details, attr, None) or (details.id if name == provider else None)
+                if value:
+                    id_fields[kwarg] = str(value)
+            if id_fields:
+                async with db.transaction(session=session):
+                    await db.anime.update_metadata_if_empty(anime_id, **id_fields)
+            await session.commit()
+            self.logger.info(
+                f"'{title}' 由 {provider} 补全 (ID: {details.id}): {', '.join(updated) or '无新增字段'}"
+            )
+            return provider
+        return None
+
+    @profile_flow(FLOW_AUTO_SCRAPE)
+    async def run(self, session: AsyncSession, progress_callback: Callable, task_config: dict = None):
+        """
+        定时任务的核心逻辑。
+        1. 获取所有TV系列作品
+        2. 对于没有TMDB ID的作品，通过标题搜索TMDB获取ID
+        3. 刮削别名信息
+        4. 获取并映射剧集组信息
+
+        Args:
+            task_config: 任务实例级配置字典，包含 forceScrape 等选项。
+        """
+        # DatabaseService 由文件顶部统一导入，避免错误的服务模块导入和重复初始化。
+        db = get_database_service()
+
+        if task_config is None:
+            task_config = {}
+        force_scrape = task_config.get("forceScrape", False)
+        enable_episode_group = task_config.get("enableEpisodeGroup", False)
+        opts = self._parse_options(task_config)
+        primary = opts["primary"]
+        if primary != DEFAULT_PRIMARY_PROVIDER and primary not in self.metadata_manager.sources:
+            self.logger.warning(f"主刮削源 {primary} 未加载，回退为 TMDB")
+            primary = opts["primary"] = DEFAULT_PRIMARY_PROVIDER
+        self.logger.info(
+            f"开始执行 [{self.job_name}] 定时任务... (强制刮削: {'开启' if force_scrape else '关闭'}, "
+            f"剧集组刮削: {'开启' if enable_episode_group else '关闭'}, 主源: {primary}, "
+            f"兜底: {','.join(opts['fallbacks']) if opts['fallback_enabled'] and opts['fallbacks'] else '关闭'}, "
+            f"别名/海报/年份: {opts['alias_mode']}/{opts['poster_mode']}/{opts['year_mode']}, "
+            f"破图检测: {'开启' if opts['broken_check'] else '关闭'}, 海报本地化: {'开启' if opts['localize'] else '关闭'})"
+        )
+        await progress_callback(0, "正在初始化...")
+
+        # 为元数据管理器调用创建一个虚拟用户对象
+        user = User(id=0, username="scheduled_task")
+
+        # 【性能优化】AI初始化预热：如果AI已启用，提前开始初始化（不阻塞）
+        ai_matcher_warmup_task = None
+        ai_matcher = None
+        ai_available = False
+        ai_match_enabled = False
+        ai_recognition_enabled = False
+        ai_alias_correction_enabled = False
+        try:
+            # AI能力开关分别控制具体场景；密钥可用性只作为共同前置条件。
+            ai_available = await self.ai_service.is_available()
+            async with db.transaction():
+                ai_match_enabled = await db.config.get_value("aiMatchEnabled", "false") == "true"
+                ai_recognition_enabled = await db.config.get_value("aiRecognitionEnabled", "false") == "true"
+                ai_alias_correction_enabled = await db.config.get_value("aiAliasCorrectionEnabled", "false") == "true"
+
+                if ai_available and (ai_recognition_enabled or ai_alias_correction_enabled):
+                    if ai_recognition_enabled:
+                        self.logger.info("AI辅助识别已启用")
+                    if ai_alias_correction_enabled:
+                        self.logger.info("AI别名修正已启用")
+
+                    # 动态注册AI提示词配置，确保功能首次启用时配置项存在。
+                    await db.config.initialize_configs({
+                        "aiMatchPrompt": (DEFAULT_AI_MATCH_PROMPT, "AI智能匹配提示词"),
+                        "aiRecognitionPrompt": (DEFAULT_AI_RECOGNITION_PROMPT, "AI辅助识别提示词"),
+                        "aiAliasValidationPrompt": (DEFAULT_AI_ALIAS_VALIDATION_PROMPT, "AI别名验证提示词")
+                    })
+
+            # 配置提交后再预热，避免后台协程继承即将关闭的事务上下文。
+            if ai_available and (ai_match_enabled or ai_recognition_enabled or ai_alias_correction_enabled):
+                ai_matcher_warmup_task = asyncio.create_task(self.ai_service.get_matcher())
+                self.logger.debug("自动刮削 AI匹配器预热已启动（并行）")
+        except Exception as e:
+            self.logger.warning(f"初始化AI matcher失败: {e}, 将使用传统搜索")
+
+        # 获取候选作品（剧集形态含综艺/短剧 + 电影），同时带出别名/海报信息用于增量跳过判断。
+        # 查询经 DatabaseService → AnimeQueryRepository 执行，任务内不再直接拼 SQL（架构规范）。
+        async with db.transaction(session=session):
+            shows_to_update = await db.anime.list_auto_scrape_candidates(AUTO_SCRAPE_TYPES)
+
+        total_shows = len(shows_to_update)
+        self.logger.info(f"找到 {total_shows} 个作品需要处理(剧集/综艺/短剧/电影)。")
+        await progress_callback(5, f"找到 {total_shows} 个作品待处理")
+
+        processed_count = 0
+        scraped_count = 0
+        mapped_count = 0
+        skipped_count = 0
+        fallback_count = 0  # 主源无结果、由兜底源补全的作品数
+        broken_count = 0  # 检测到破图的作品数
+        fallback_providers = opts["fallbacks"] if opts["fallback_enabled"] else []
+
+        for i, show in enumerate(shows_to_update):
+            current_progress = 5 + int((i / total_shows) * 95) if total_shows > 0 else 95
+            anime_id = show['animeId']
+            title = show['title']
+            year = show.get('year')
+            tmdb_id = show.get('tmdbId')
+
+            await progress_callback(current_progress, f"正在处理: {title} ({i+1}/{total_shows})")
+            self.logger.info(f"正在处理: '{title}' (Anime ID: {anime_id}, TMDB ID: {tmdb_id or '无'})")
+
+            try:
+                # 破图检测：本地海报缺失/损坏时视为无海报，本条不做增量跳过
+                image_broken = False
+                if opts["broken_check"] and opts["poster_mode"] != "skip":
+                    image_broken = await is_local_poster_broken(show.get('localImagePath'))
+                    if image_broken:
+                        broken_count += 1
+                        self.logger.info(f"'{title}' 本地海报缺失或损坏，将重新补充海报")
+                poster_missing = opts["poster_mode"] != "skip" and (image_broken or not show.get('imageUrl'))
+
+                # 非 TMDB 主源：通用刮削（别名/海报/年份/源 ID），失败再走兜底源；不做剧集组
+                if primary != DEFAULT_PRIMARY_PROVIDER:
+                    if not force_scrape and show.get('hasAlias') and not poster_missing and year:
+                        skipped_count += 1
+                        processed_count += 1
+                        continue
+                    search_type = show.get('type') or 'tv_series'
+                    search_title = parse_search_keyword(title).get("title") or title
+                    hit = await self._scrape_from_fallback(
+                        db, session, anime_id, title, year, search_title, search_type, user,
+                        opts, image_broken, providers=[primary], strict=False,
+                    )
+                    if hit:
+                        scraped_count += 1
+                    elif show.get('type') not in NO_FALLBACK_TYPES and await self._scrape_from_fallback(
+                        db, session, anime_id, title, year, search_title, search_type, user,
+                        opts, image_broken, providers=fallback_providers,
+                    ):
+                        fallback_count += 1
+                    processed_count += 1
+                    continue
+
+                # 非强制刮削模式下，增量跳过已有完整数据的条目：
+                # - 已有 TMDB ID + 已有别名 + 海报完好 + (未开启剧集组 或 已有剧集组) → 跳过
+                existing_group_id = show.get('tmdbEpisodeGroupId')
+                has_alias = show.get('hasAlias', False)
+                if not force_scrape and tmdb_id and has_alias and not poster_missing:
+                    # 如果不需要剧集组，或者已有剧集组，则完全跳过
+                    if not enable_episode_group or existing_group_id:
+                        skip_reason = "已有TMDB ID和别名"
+                        if existing_group_id:
+                            skip_reason += f"和剧集组({existing_group_id})"
+                        self.logger.debug(f"增量跳过 '{title}': {skip_reason}")
+                        skipped_count += 1
+                        processed_count += 1
+                        continue
+
+                # 初始化变量
+                use_episode_group = False
+                recognized_season = None
+                search_type = show.get('type') or 'tv_series'  # 提前初始化,供AI验证别名使用
+
+                # 步骤 0: 强制刮削时校验已有 TMDB ID。入库时存错的 ID 以前会被一直沿用，
+                # 这里标题（含别名）与年份都对不上才判定为错，清空后走下面的标题搜索重新匹配。
+                replace_wrong_id = False
+                if force_scrape and tmdb_id:
+                    if not await self._is_stored_tmdb_id_plausible(tmdb_id, title, year, search_type, user):
+                        self.logger.warning(f"'{title}' 现有 TMDB ID {tmdb_id} 与标题/年份不符，将重新搜索")
+                        tmdb_id = None
+                        replace_wrong_id = True
+
+                # 步骤 1: 如果没有TMDB ID，尝试通过标题搜索获取
+                if not tmdb_id:
+                    self.logger.info(f"'{title}' 没有TMDB ID，尝试搜索...")
+                    try:
+                        # 使用AI标准化标题 (如果启用)
+                        search_title = title
+                        search_year = year
+
+                        # 【性能优化】第一次使用AI时，await预热task
+                        if ai_matcher_warmup_task and not ai_matcher:
+                            ai_matcher = await ai_matcher_warmup_task
+                            ai_matcher_warmup_task = None  # 清空task，避免重复await
+                            if not ai_matcher:
+                                self.logger.warning("AI匹配器初始化失败,将使用传统搜索")
+
+                        if ai_matcher and ai_recognition_enabled:
+                            try:
+                                recognition_result = await self.ai_service.recognize_title(
+                                    title=title,
+                                    year=year,
+                                    anime_type=search_type
+                                )
+                                if recognition_result:
+                                    search_title = recognition_result.get("search_title", title)
+                                    search_year = recognition_result.get("year", year)
+                                    search_type = recognition_result.get("type", search_type)
+                                    use_episode_group = recognition_result.get("use_episode_group", False)
+                                    recognized_season = recognition_result.get("season")
+
+                                    if recognized_season:
+                                        self.logger.info(f"AI识别到季度: {recognized_season}")
+                                        # 如果识别到季度信息，去除标题中的季度后缀
+                                        # 匹配 "第X季", "第X期", "Season X", "S X" 等格式
+                                        season_pattern = r'\s*(?:第[0-9一二三四五六七八九十百千万]+[季期]|Season\s*\d+|S\s*\d+)\s*$'
+                                        cleaned_title = re.sub(season_pattern, '', search_title, flags=re.IGNORECASE)
+                                        if cleaned_title != search_title:
+                                            self.logger.info(f"去除季度后缀: '{search_title}' → '{cleaned_title}'")
+                                            search_title = cleaned_title
+
+                                    if use_episode_group:
+                                        self.logger.info(f"AI识别: 该作品需要使用剧集组")
+
+                                    self.logger.info(f"AI标准化: '{title}' → '{search_title}' (year={search_year}, type={search_type})")
+                            except Exception as e:
+                                self.logger.warning(f"AI标准化失败: {e}, 使用原标题搜索")
+
+                        # 后备：如果AI未启用或AI未识别到季度，尝试用正则提取季度信息并清理标题
+                        if recognized_season is None:
+                            parsed = parse_search_keyword(search_title)
+                            if parsed.get("season") is not None:
+                                recognized_season = parsed["season"]
+                                search_title = parsed["title"]
+                                self.logger.info(f"正则提取季度: '{title}' → '{search_title}' (season={recognized_season})")
+
+                        # 根据类型选择mediaType
+                        media_type = "movie" if is_movie_type(search_type) else "tv"
+
+                        search_results = await self.metadata_manager.search("tmdb", search_title, user, mediaType=media_type)
+                        if search_results:
+                            # 智能选择最佳匹配结果
+                            best_match = None
+
+                            # 如果AI识别到季度信息,说明肯定是TV类型
+                            if recognized_season is not None and media_type == "tv":
+                                self.logger.info(f"检测到季度信息(season={recognized_season}),强制使用TV类型筛选")
+                                # 筛选TV类型的结果
+                                tv_results = [r for r in search_results if r.type == "tv" or not r.type]
+                                if tv_results:
+                                    search_results = tv_results
+                                    self.logger.info(f"筛选后剩余 {len(tv_results)} 个TV类型结果")
+
+                            # 如果有多个结果且启用了AI匹配，使用AI智能选择
+                            if ai_matcher and ai_match_enabled and len(search_results) > 1:
+                                self.logger.info(f"TMDB搜索返回 {len(search_results)} 个结果，使用AI智能匹配...")
+
+                                # 转换MetadataDetailsResponse为ProviderSearchInfo格式供AI使用
+                                provider_results = []
+                                for r in search_results:
+                                    provider_results.append(ProviderSearchInfo(
+                                        provider="tmdb",
+                                        mediaId=r.tmdbId or r.id,
+                                        title=r.title,
+                                        type=r.type or "unknown",
+                                        season=1,
+                                        year=r.year,
+                                        imageUrl=r.imageUrl,
+                                        episodeCount=None
+                                    ))
+
+                                # 构建查询信息
+                                query_info = {
+                                    "title": title,  # 使用原始标题（包含季度信息）
+                                    "year": year,
+                                    "type": search_type
+                                }
+
+                                try:
+                                    # 调用AI匹配
+                                    best_index = await self.ai_service.select_best_match(
+                                        query_info, provider_results, favorited_info={}
+                                    )
+                                    if best_index is not None:
+                                        best_match = search_results[best_index]
+                                        self.logger.info(f"AI选择了结果 #{best_index}: {best_match.title} ({best_match.year})")
+                                    else:
+                                        self.logger.warning("AI未能选择合适的匹配，使用第一个结果")
+                                        best_match = search_results[0]
+                                except Exception as e:
+                                    self.logger.warning(f"AI匹配失败: {e}，使用第一个结果")
+                                    best_match = search_results[0]
+                            else:
+                                # 没有AI或只有一个结果，使用传统匹配
+                                best_match = search_results[0]
+
+                                # 年份匹配
+                                if search_year and len(search_results) > 1:
+                                    # 尝试找到年份匹配的结果
+                                    for result in search_results:
+                                        if result.year == search_year:
+                                            best_match = result
+                                            self.logger.info(f"找到年份匹配的结果: {result.title} ({result.year})")
+                                            break
+
+                            tmdb_id = best_match.tmdbId or best_match.id
+                            self.logger.info(f"为 '{title}' 找到TMDB ID: {tmdb_id} (类型: {best_match.type or 'unknown'})")
+
+                            # 使用任务会话执行 Repository 写入，避免创建额外连接。
+                            async with db.transaction(session=session):
+                                if replace_wrong_id:
+                                    await db.anime.replace_tmdb_id(anime_id, tmdb_id)
+                                    existing_group_id = None
+                                else:
+                                    await db.anime.update_metadata_if_empty(
+                                        anime_id,
+                                        tmdb_id=tmdb_id
+                                    )
+                            scraped_count += 1
+                        else:
+                            # 回退策略: 如果检测到季度信息，尝试从数据库中同系列作品继承TMDB ID
+                            if recognized_season is not None:
+                                base_title = search_title  # 已被 parse_search_keyword 或 AI 清理过的基础标题
+                                self.logger.info(f"TMDB搜索无结果，尝试从同系列作品继承TMDB ID (基础标题: '{base_title}')")
+                                # 同系列查询迁入仓储；综艺/短剧同属剧集形态
+                                async with db.transaction(session=session):
+                                    inherited_tmdb_id = await db.anime.find_sibling_tmdb_id(
+                                        base_title, list(SERIES_TYPES), anime_id
+                                    )
+
+                                if inherited_tmdb_id:
+                                    tmdb_id = inherited_tmdb_id
+                                    self.logger.info(f"从同系列作品继承TMDB ID: '{title}' → TMDB ID: {tmdb_id}")
+                                    async with db.transaction(session=session):
+                                        if replace_wrong_id:
+                                            await db.anime.replace_tmdb_id(anime_id, tmdb_id)
+                                            existing_group_id = None
+                                        else:
+                                            await db.anime.update_metadata_if_empty(
+                                                anime_id,
+                                                tmdb_id=tmdb_id
+                                            )
+                                    scraped_count += 1
+                                else:
+                                    self.logger.warning(f"未能为 '{title}' 找到TMDB搜索结果，也未找到同系列作品的TMDB ID。")
+                            else:
+                                self.logger.warning(f"未能为 '{title}' 找到TMDB搜索结果。")
+
+                            # TMDB 与同系列继承都没拿到 ID：动画类作品用 Bangumi / AniList 兜底补别名/海报/年份
+                            if not tmdb_id:
+                                if show.get('type') not in NO_FALLBACK_TYPES and await self._scrape_from_fallback(
+                                    db, session, anime_id, title, year, search_title, search_type, user,
+                                    opts, image_broken, providers=fallback_providers,
+                                ):
+                                    fallback_count += 1
+                                    processed_count += 1
+                                continue
+                    except Exception as e:
+                        self.logger.error(f"搜索 '{title}' 时发生错误: {e}")
+                        await session.rollback()
+                        continue
+
+                # 步骤 1.5: 对于已有TMDB ID的作品，也需要识别季度信息
+                # （搜索分支内的AI识别和正则提取只在没有TMDB ID时执行）
+                if recognized_season is None:
+                    parsed = parse_search_keyword(title)
+                    if parsed.get("season") is not None:
+                        recognized_season = parsed["season"]
+                        self.logger.info(f"正则提取季度(已有TMDB ID): '{title}' → season={recognized_season}")
+
+                # 步骤 2: 获取媒体详情，包括别名
+                # 根据作品类型决定mediaType参数
+                media_type_for_details = "movie" if is_movie_type(search_type) else "tv"
+                details = await self.metadata_manager.get_details("tmdb", tmdb_id, user, mediaType=media_type_for_details)
+                if not details:
+                    self.logger.warning(f"未能从 TMDB 获取 '{title}' (ID: {tmdb_id}) 的详情 (mediaType={media_type_for_details})。")
+                    continue
+
+                # 步骤 2.5: 顺手补全空的海报和年份（只填空值，不覆盖入库/用户已有数据）；随本作品的提交一起落库
+                filled_basic = await self._write_basic(
+                    db, session, anime_id, details, DEFAULT_PRIMARY_PROVIDER, opts, image_broken
+                )
+                if filled_basic:
+                    self.logger.info(f"为 '{title}' 补全了基础信息: {', '.join(filled_basic)}")
+
+                # 步骤 3: 准备别名（暂不更新到数据库，等待剧集组识别后可能需要追加季度后缀）
+                aliases_to_update = extract_aliases_from_details(details)
+                force_update = False
+
+                # 已有 TMDB ID 的作品也经服务初始化，不依赖前面的标题识别分支。
+                if ai_available and ai_alias_correction_enabled and is_series_type(search_type) and aliases_to_update:
+                    aliases_to_update, force_update = await validate_aliases_with_ai(
+                        title, year, search_type, aliases_to_update, self.ai_service, ai_alias_correction_enabled
+                    )
+
+                # 步骤 3.5: 如果识别到季度>=2，为中文别名追加季度后缀
+                # 无论是否开启剧集组刮削，都需要确保别名与标题中的季度信息一致
+                if recognized_season is not None and recognized_season >= 2 and aliases_to_update:
+                    season_suffix = f" 第{recognized_season}季"
+                    if aliases_to_update.get("aliases_cn"):
+                        updated_cn_aliases = []
+                        for cn_alias in aliases_to_update["aliases_cn"]:
+                            if cn_alias and not cn_alias.endswith(season_suffix):
+                                updated_cn_aliases.append(cn_alias + season_suffix)
+                            else:
+                                updated_cn_aliases.append(cn_alias)
+                        aliases_to_update["aliases_cn"] = updated_cn_aliases
+                        self.logger.info(f"为 '{title}' 的中文别名追加季度后缀: {season_suffix}")
+
+                # 步骤 4: 智能季度匹配 - 两级查找逻辑 (仅适用于TV系列)
+                # 第一级: 使用seasons信息进行匹配(方案A)
+                # 第二级: 使用"Seasons"剧集组进行匹配(方案C)
+
+                # 电影类型或未开启剧集组刮削时，跳过剧集组处理，直接更新别名
+                if show.get('type') == 'movie' or not enable_episode_group:
+                    skip_reason = "电影类型" if show.get('type') == 'movie' else "未开启剧集组刮削"
+                    self.logger.info(f"'{title}' {skip_reason}，跳过剧集组处理。")
+                    # 更新别名到数据库
+                    if aliases_to_update and any(aliases_to_update.values()):
+                        updated_fields = await self._write_aliases(db, session, anime_id, aliases_to_update, force_update, opts)
+                        if updated_fields:
+                            mode_str = "(AI修正模式)" if force_update else ""
+                            self.logger.info(f"为 '{title}' 更新了别名{mode_str}: {', '.join(updated_fields)}")
+                    await session.commit()
+                    processed_count += 1
+                    continue
+
+                tmdb_source = self.metadata_manager.sources.get("tmdb")
+                if not tmdb_source or not hasattr(tmdb_source, 'get_all_episode_groups'):
+                    self.logger.warning(f"TMDB源不支持 get_all_episode_groups 方法，跳过 '{title}' 的剧集组处理。")
+                    # 即使不支持剧集组，也要更新别名
+                    if aliases_to_update and any(aliases_to_update.values()):
+                        updated_fields = await self._write_aliases(db, session, anime_id, aliases_to_update, force_update, opts)
+                        if updated_fields:
+                            mode_str = "(AI修正模式)" if force_update else ""
+                            self.logger.info(f"为 '{title}' 更新了别名{mode_str}: {', '.join(updated_fields)}")
+                    await session.commit()
+                    processed_count += 1
+                    continue
+
+                season_matched = False
+                groups_to_process = []
+                all_groups = []
+
+                # 第一级: 如果AI识别到季度信息,尝试使用seasons数据进行匹配
+                if recognized_season is not None and details.seasons:
+                    self.logger.info(f"第一级匹配: 使用seasons信息查找季度 {recognized_season}")
+
+                    # 查找对应季度的season信息
+                    target_season = None
+                    for season in details.seasons:
+                        if season.season_number == recognized_season:
+                            target_season = season
+                            break
+
+                    if target_season:
+                        self.logger.info(f"✓ 找到匹配的季度: {target_season.name} (ID: {target_season.id}, 集数: {target_season.episode_count})")
+                        season_matched = True
+
+                        # 获取所有剧集组,尝试找到匹配该季度的剧集组
+                        all_groups = await tmdb_source.get_all_episode_groups(int(tmdb_id), user)
+                        if all_groups:
+                            self.logger.info(f"为 '{title}' 找到 {len(all_groups)} 个剧集组: {[g.get('name') for g in all_groups]}")
+
+                            # 尝试找到匹配该季度的剧集组
+                            for g in all_groups:
+                                group_name = g.get('name', '').lower()
+
+                                # 特殊处理第0季(特别季)
+                                if recognized_season == 0:
+                                    if ("special" in group_name or
+                                        "season 0" in group_name or
+                                        "s00" in group_name or
+                                        "s0" in group_name or
+                                        "特别" in group_name):
+                                        groups_to_process.append(g)
+                                        self.logger.info(f"✓ 找到特别季剧集组: {g.get('name')}")
+                                else:
+                                    # 匹配 "season 2", "第2季", "s02" 等格式
+                                    if (f"season {recognized_season}" in group_name or
+                                        f"第{recognized_season}季" in group_name or
+                                        f"s{recognized_season:02d}" in group_name or
+                                        f"s{recognized_season}" in group_name):
+                                        groups_to_process.append(g)
+                                        self.logger.info(f"✓ 找到匹配季度{recognized_season}的剧集组: {g.get('name')}")
+                    else:
+                        self.logger.warning(f"✗ 未找到季度 {recognized_season} 的seasons信息")
+
+                # 第二级: 如果第一级没有找到,使用"Seasons"剧集组进行匹配
+                if not season_matched or not groups_to_process:
+                    self.logger.info(f"第二级匹配: 使用剧集组查找")
+
+                    if not all_groups:
+                        all_groups = await tmdb_source.get_all_episode_groups(int(tmdb_id), user)
+
+                    if not all_groups:
+                        self.logger.info(f"'{title}' (TMDB ID: {tmdb_id}) 没有找到任何剧集组。")
+                        # 即使没有剧集组，也要更新别名
+                        if aliases_to_update and any(aliases_to_update.values()):
+                            updated_fields = await self._write_aliases(db, session, anime_id, aliases_to_update, force_update, opts)
+                            if updated_fields:
+                                mode_str = "(AI修正模式)" if force_update else ""
+                                self.logger.info(f"为 '{title}' 更新了别名{mode_str}: {', '.join(updated_fields)}")
+                        await session.commit()
+                        processed_count += 1
+                        continue
+
+                    self.logger.info(f"为 '{title}' 找到 {len(all_groups)} 个剧集组: {[g.get('name') for g in all_groups]}")
+
+                    # 优先选择"Seasons"剧集组
+                    seasons_group = None
+                    for g in all_groups:
+                        group_name = g.get('name', '').lower()
+                        if 'seasons' in group_name:
+                            seasons_group = g
+                            self.logger.info(f"✓ 找到'Seasons'剧集组: {g.get('name')}")
+                            break
+
+                    if seasons_group:
+                        groups_to_process = [seasons_group]
+                    else:
+                        # 如果没有"Seasons"剧集组,使用默认逻辑(type=1的剧集组)
+                        groups_to_process = [g for g in all_groups if g.get('type') == 1]
+                        if groups_to_process:
+                            self.logger.info(f"未找到'Seasons'剧集组,使用默认逻辑(type=1)")
+
+                if not groups_to_process:
+                    self.logger.info(f"'{title}' 没有找到“原始播出顺序”(type=1)的剧集组，跳过映射更新。")
+                    # 即使没有剧集组，也要更新别名
+                    if aliases_to_update and any(aliases_to_update.values()):
+                        updated_fields = await self._write_aliases(db, session, anime_id, aliases_to_update, force_update, opts)
+                        if updated_fields:
+                            mode_str = "(AI修正模式)" if force_update else ""
+                            self.logger.info(f"为 '{title}' 更新了别名{mode_str}: {', '.join(updated_fields)}")
+                    await session.commit()
+                    processed_count += 1
+                    continue
+
+                self.logger.info(f"为 '{title}' 选择了 {len(groups_to_process)} 个剧集组进行映射更新。")
+
+                # 步骤 5: 为每个选定的剧集组，更新映射表
+                for group in groups_to_process:
+                    group_id = group.get('id')
+                    if not group_id:
+                        continue
+
+                    self.logger.info(f"正在为 '{title}' 更新剧集组 '{group.get('name')}' (ID: {group_id}) 的映射...")
+                    await self.metadata_manager.update_tmdb_mappings(int(tmdb_id), group_id, user)
+
+                    # 步骤 6: 更新作品关联的主剧集组ID
+                    async with db.transaction(session=session):
+                        await db.anime.update_tmdb_group_id(anime_id, group_id)
+                    self.logger.info(f"已将 '{title}' 的主剧集组ID更新为: {group_id}")
+                    mapped_count += 1
+
+                    # 步骤 7: 如果使用了剧集组匹配,在中文别名后追加季度信息
+                    # 从剧集组名称中提取季度信息
+                    group_name = group.get('name', '')
+                    season_suffix = None
+
+                    # 尝试从剧集组名称中提取季度
+                    # 匹配 "Season 2", "第2季", "S02", "S2" 等格式
+                    season_match = re.search(r'(?:season\s+|第|s)(\d+)(?:季)?', group_name, re.IGNORECASE)
+                    if season_match:
+                        season_num = int(season_match.group(1))
+                        # 只为第二季及以后追加季度后缀
+                        if season_num >= 2:
+                            season_suffix = f" 第{season_num}季"
+                            self.logger.info(f"检测到剧集组季度信息: {season_suffix}")
+
+                            # 在AI验证后的别名上追加季度后缀
+                            if aliases_to_update and aliases_to_update.get("aliases_cn"):
+                                updated_cn_aliases = []
+                                for cn_alias in aliases_to_update["aliases_cn"]:
+                                    if cn_alias and not cn_alias.endswith(season_suffix):
+                                        updated_cn_aliases.append(cn_alias + season_suffix)
+                                    else:
+                                        updated_cn_aliases.append(cn_alias)
+                                aliases_to_update["aliases_cn"] = updated_cn_aliases
+                                self.logger.info(f"已为 '{title}' 的AI验证后的中文别名追加季度后缀: {season_suffix}")
+                        else:
+                            self.logger.info(f"检测到第{season_num}季,跳过追加季度后缀(仅第二季及以后追加)")
+
+                # 步骤 8: 更新别名到数据库（在剧集组处理完成后，可能已追加季度后缀）
+                if aliases_to_update and any(aliases_to_update.values()):
+                    updated_fields = await self._write_aliases(db, session, anime_id, aliases_to_update, force_update, opts)
+                    if updated_fields:
+                        mode_str = "(AI修正模式)" if force_update else ""
+                        self.logger.info(f"为 '{title}' 更新了别名{mode_str}: {', '.join(updated_fields)}")
+
+                await session.commit() # 提交本次节目的所有更改
+                processed_count += 1
+
+            except Exception as e:
+                self.logger.error(f"处理 '{title}' 时发生错误: {e}", exc_info=True)
+                await session.rollback() # 出错时回滚
+            finally:
+                await asyncio.sleep(1) # 简单的速率限制，防止对TMDB API造成过大压力
+
+        self.logger.info(f"定时任务 [{self.job_name}] 执行完毕。")
+        skip_info = f", 跳过 {skipped_count} 个已有数据" if skipped_count > 0 else ""
+        # 兜底源补全的作品单独计数，便于区分"TMDB 命中"与"Bangumi/AniList 兜底"
+        if fallback_count > 0:
+            skip_info += f", 兜底补全 {fallback_count} 个"
+        if broken_count > 0:
+            skip_info += f", 检测到破图 {broken_count} 个"
+        self.logger.info(f"统计: 共处理 {processed_count}/{total_shows} 个作品, 刮削 {scraped_count} 个{PROVIDER_LABELS.get(primary, primary)} ID, 映射 {mapped_count} 个剧集组{skip_info}。")
+        # 修正：抛出 TaskSuccess 异常，以便 TaskManager 可以用一个有意义的消息来结束任务
+        raise TaskSuccess(f"任务执行完毕，共处理 {processed_count}/{total_shows} 个作品, 刮削 {scraped_count} 个{PROVIDER_LABELS.get(primary, primary)} ID, 映射 {mapped_count} 个剧集组{skip_info}。")

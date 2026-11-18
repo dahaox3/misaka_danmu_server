@@ -1,15 +1,23 @@
 import asyncio
+import base64
+import hashlib
+import hmac
 import logging
 import re
 import urllib.parse
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote
 
 import httpx
 from bs4 import BeautifulSoup
 from fastapi import HTTPException, status
 from pydantic import BaseModel, ValidationError, field_validator
 
-from src.db import crud, models
+from src.schemas import MetadataDetailsResponse, ProviderSearchInfo, User
+from src.services.service_container import get_database_service
+from src.utils import parse_search_keyword
+from src.utils.parsing.filename_parser import get_season_from_title
 from .base import BaseMetadataSource, HTTPStatusError
 
 logger = logging.getLogger(__name__)
@@ -45,9 +53,34 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
     has_force_aux_search_toggle = True # 新增：硬编码标志
     is_failover_source = True
     supports_episode_urls = True  # 支持获取分集URL
+
+    # ============ 搜索补充源能力（豆瓣移动端 rexxar 平台直链）============
+    # 参考上游 danmu_api 的 douban 源：rexxar 详情接口的 vendors 带各平台真实播放 ID，
+    # 解析成 (弹幕源, mediaId) 后直接交给已有弹幕源拉分集与弹幕（与 bangumi-data 直链同路径，不套 sup_ 前缀）。
+    # Frodo 接口的 vendors 常为空，故补充能力只走 rexxar。
+    is_search_supplement_source = True
+    PLATFORM_TO_PROVIDER: Dict[str, str] = {
+        "qq": "tencent",
+        "iqiyi": "iqiyi",
+        "youku": "youku",
+        "bilibili": "bilibili",
+        "miguvideo": "migu",
+        "mgtv": "mgtv",
+    }
+    configurable_fields = {
+        "searchSupplementEnabled": ("启用搜索补充", "boolean", "启用后，当弹幕源搜索无结果时，将通过豆瓣条目的平台播放直链为其补充搜索结果"),
+    }
+    _REXXAR_BASE = "https://m.douban.com/rexxar/api/v2"
+    _REXXAR_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+        "Referer": "https://m.douban.com/movie/",
+    }
+    # 每次补充最多展开的豆瓣条目数（每条一次详情请求），控制请求量
+    _SUPPLEMENT_MAX_SUBJECTS = 3
+
     async def _create_client(self) -> httpx.AsyncClient:
         """Creates an httpx.AsyncClient with Douban cookie and proxy settings."""
-        cookie = await self.config_manager.get("doubanCookie", "")
+        cookie = await self.config_service.get("doubanCookie", "")
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -56,11 +89,11 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
             headers["Cookie"] = cookie
 
         # 获取代理模式
-        proxy_mode = await self.config_manager.get("proxyMode", "none")
+        proxy_mode = await self.config_service.get("proxyMode", "none")
 
         # 兼容旧配置：如果 proxyMode 为 none 但 proxyEnabled 为 true，则使用 http_socks 模式
         if proxy_mode == "none":
-            proxy_enabled_globally = (await self.config_manager.get("proxyEnabled", "false")).lower() == 'true'
+            proxy_enabled_globally = (await self.config_service.get("proxyEnabled", "false")).lower() == 'true'
             if proxy_enabled_globally:
                 proxy_mode = "http_socks"
 
@@ -68,10 +101,11 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
 
         # 只有 http_socks 模式才需要设置 httpx 的 proxy 参数
         if proxy_mode == "http_socks":
-            proxy_url = await self.config_manager.get("proxyUrl", "")
+            proxy_url = await self.config_service.get("proxyUrl", "")
             if proxy_url:
-                async with self._session_factory() as session:
-                    metadata_settings = await crud.get_all_metadata_source_settings(session)
+                db = get_database_service()
+                async with db.transaction():
+                    metadata_settings = await db.metadata_source.get_all_metadata_source_settings()
 
                 provider_setting = next((s for s in metadata_settings if s['providerName'] == self.provider_name), None)
                 use_proxy_for_this_provider = provider_setting.get('useProxy', False) if provider_setting else False
@@ -80,7 +114,127 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
 
         return httpx.AsyncClient(headers=headers, timeout=20.0, follow_redirects=True, proxy=proxy_to_use)
 
-    async def search(self, keyword: str, user: models.User, mediaType: Optional[str] = None) -> List[models.MetadataDetailsResponse]:
+    @staticmethod
+    def _vendor_to_media_id(vendor: Dict[str, Any], is_movie: bool) -> Optional[Tuple[str, str]]:
+        """把 rexxar vendors 单项解析为 (弹幕源名, mediaId)，格式需与各弹幕源 get_episodes 的入参一致。
+
+        - 腾讯：uri 的 cid
+        - 爱奇艺：uri 的 aid（专辑 ID，本地爱奇艺源纯数字 mediaId 即走专辑接口）
+        - 优酷：uri 的 showid
+        - B站：uri 路径末段为 season_id，补成 ss{id}
+        - 咪咕：uri 的 action JSON 内 contentID
+        - 芒果：uri/url 中的 collection_id（未实测到样本，按常见格式尽力解析）
+        """
+        vendor_id = vendor.get("id") or ""
+        provider = DoubanMetadataSource.PLATFORM_TO_PROVIDER.get(vendor_id)
+        uri = vendor.get("uri") or ""
+        if not provider or not uri:
+            return None
+        decoded = urllib.parse.unquote(uri)
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(uri).query)
+
+        def _q(name: str) -> Optional[str]:
+            values = query.get(name)
+            return values[0] if values and values[0] else None
+
+        media_id: Optional[str] = None
+        if vendor_id == "qq":
+            media_id = _q("cid")
+        elif vendor_id == "iqiyi":
+            media_id = _q("aid")
+        elif vendor_id == "youku":
+            media_id = _q("showid")
+        elif vendor_id == "bilibili":
+            tail = urllib.parse.urlparse(uri).path.rstrip("/").split("/")[-1]
+            tail = tail[2:] if tail.startswith("ss") else tail
+            media_id = f"ss{tail}" if tail.isdigit() else None
+        elif vendor_id == "miguvideo":
+            match = re.search(r'"contentID"\s*:\s*"?(\d+)', decoded)
+            media_id = match.group(1) if match else None
+        elif vendor_id == "mgtv":
+            match = re.search(r'(?:collection_id|clipId|cid)=(\d+)', decoded) or re.search(r'/b/(\d+)/', vendor.get("url") or "")
+            media_id = match.group(1) if match else None
+        return (provider, media_id) if media_id else None
+
+    async def _rexxar_get(self, client: httpx.AsyncClient, path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """调用豆瓣移动端 rexxar 接口；失败或返回错误消息（如 traversal_error）时返回 None。"""
+        try:
+            response = await client.get(f"{self._REXXAR_BASE}/{path}", params=params, headers=self._REXXAR_HEADERS)
+            response.raise_for_status()
+            data = response.json()
+        except (httpx.HTTPError, ValueError) as e:
+            self.logger.warning(f"豆瓣 rexxar 请求失败 ({path}): {type(e).__name__}: {e}")
+            return None
+        if not isinstance(data, dict) or data.get("msg"):
+            return None
+        return data
+
+    async def _match_supplement_items(
+        self,
+        keyword: str,
+        providers_to_supplement: Set[str],
+        provider_platforms_map: Dict[str, List[str]],
+        user: User,
+    ) -> List[ProviderSearchInfo]:
+        """搜索补充源实现：rexxar 搜索 → 详情 vendors → 解析为已有弹幕源可直接导入的真实 mediaId。
+
+        仅补充「确实没搜到结果」的弹幕源；任何请求失败只返回空列表，不影响主搜索。
+        """
+        core_title = parse_search_keyword(keyword)["title"]
+        if not core_title:
+            return []
+        items: List[ProviderSearchInfo] = []
+        async with await self._create_client() as client:
+            search_data = await self._rexxar_get(client, "search", {"q": core_title, "start": 0, "count": 10, "type": "movie"})
+            if not search_data:
+                return []
+            normalized_kw = re.sub(r"\s+", "", core_title).lower()
+            subjects = []
+            for entry in (search_data.get("subjects") or {}).get("items") or []:
+                target = entry.get("target") or {}
+                title = target.get("title") or ""
+                # 只要标题包含关键词的条目，避免把相关推荐误当补充结果
+                # 搜索结果会混入图书等条目（target_type=book），只保留影视条目
+                if entry.get("layout") != "subject" or not target.get("id"):
+                    continue
+                if entry.get("target_type") not in ("tv", "movie"):
+                    continue
+                if normalized_kw not in re.sub(r"\s+", "", title).lower():
+                    continue
+                subjects.append((entry, target))
+                if len(subjects) >= self._SUPPLEMENT_MAX_SUBJECTS:
+                    break
+
+            for entry, target in subjects:
+                # 以 target_type 决定详情路径（type_name 是展示文案，动画/综艺也归 tv）
+                is_movie = entry.get("target_type") == "movie"
+                detail = await self._rexxar_get(client, f"{entry['target_type']}/{target['id']}", {"ck": "", "for_mobile": 1})
+                if not detail:
+                    continue
+                title = detail.get("title") or target.get("title") or core_title
+                year_raw = str(detail.get("year") or target.get("year") or "")
+                year = int(year_raw) if year_raw.isdigit() else None
+                episode_count = detail.get("episodes_count") or None
+                pic = detail.get("pic") or {}
+                image_url = pic.get("normal") or pic.get("large") or target.get("cover_url")
+                for vendor in detail.get("vendors") or []:
+                    parsed = self._vendor_to_media_id(vendor, is_movie)
+                    if not parsed or parsed[0] not in providers_to_supplement:
+                        continue
+                    provider, media_id = parsed
+                    items.append(ProviderSearchInfo(
+                        provider=provider,
+                        mediaId=media_id,
+                        title=title,
+                        type="movie" if is_movie else "tv_series",
+                        season=1 if is_movie else get_season_from_title(title),
+                        year=year,
+                        imageUrl=image_url,
+                        episodeCount=episode_count if not is_movie else None,
+                    ))
+        return items
+
+    async def search(self, keyword: str, user: User, mediaType: Optional[str] = None) -> List[MetadataDetailsResponse]:
         self.logger.info(f"豆瓣: 正在使用JSON API搜索 '{keyword}'")
         try:
             provider_setting = await self._get_provider_setting()
@@ -136,7 +290,7 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
                 results = []
                 for subject in all_subjects:
                     if subject.id not in seen_ids:
-                        results.append(models.MetadataDetailsResponse(
+                        results.append(MetadataDetailsResponse(
                             id=subject.id, doubanId=subject.id, title=subject.title,
                             details=f"评分: {subject.rate}", imageUrl=subject.cover,
                             type=subject_types.get(subject.id, "unknown"),  # 从记录的类型中获取
@@ -148,7 +302,7 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
             self.logger.error(f"豆瓣搜索失败，发生意外错误: {e}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="豆瓣搜索时发生内部错误。")
 
-    async def get_details(self, item_id: str, user: models.User, mediaType: Optional[str] = None) -> Optional[models.MetadataDetailsResponse]:
+    async def get_details(self, item_id: str, user: User, mediaType: Optional[str] = None) -> Optional[MetadataDetailsResponse]:
         self.logger.info(f"豆瓣: 正在获取详情 item_id={item_id}")
         try:
             provider_setting = await self._get_provider_setting()
@@ -190,7 +344,7 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
                     aliases_cn.insert(0, title)
                 aliases_cn = list(dict.fromkeys(aliases_cn))
 
-                return models.MetadataDetailsResponse(
+                return MetadataDetailsResponse(
                     id=item_id, doubanId=item_id, title=title,
                     imdbId=imdb_id, aliasesCn=aliases_cn, year=year,
                     supportsEpisodeUrls=False  # 豆瓣源不支持获取分集URL (Frodo API的vendors数组为空)
@@ -204,7 +358,7 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
             self.logger.error(f"解析豆瓣详情页时发生错误: {e}")
             raise HTTPException(status_code=500, detail="解析豆瓣详情页失败。")
 
-    async def search_aliases(self, keyword: str, user: models.User) -> Set[str]:
+    async def search_aliases(self, keyword: str, user: User) -> Set[str]:
         self.logger.info(f"豆瓣: 正在为 '{keyword}' 搜索别名")
         local_aliases: Set[str] = set()
         try:
@@ -247,7 +401,7 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
         try:
             # 豆瓣Cookie是可选的，没有Cookie也可以正常使用（匿名访问）
             # 只有被流控或封禁时才需要填Cookie
-            douban_cookie = await self.config_manager.get("doubanCookie", "")
+            douban_cookie = await self.config_service.get("doubanCookie", "")
             if not douban_cookie or douban_cookie.strip() == "":
                 return {"code": "ok", "message": "配置正常 (匿名访问，被流控时可配置Cookie)"}
 
@@ -259,24 +413,26 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
         except Exception as e:
             return {"code": "error", "message": f"配置检查失败: {e}"}
 
-    async def execute_action(self, action_name: str, payload: Dict, user: models.User) -> Any:
+    async def execute_action(self, action_name: str, payload: Dict, user: User) -> Any:
         """Douban source does not support custom actions."""
         raise NotImplementedError(f"源 '{self.provider_name}' 不支持任何自定义操作。")
 
     async def _get_provider_setting(self) -> Dict[str, Any]:
         """辅助函数,用于从数据库获取当前源的设置。"""
-        async with self._session_factory() as session:
-            settings = await crud.get_all_metadata_source_settings(session)
-            provider_setting = next((s for s in settings if s['providerName'] == self.provider_name), None)
-            return provider_setting or {}
+        db = get_database_service()
+        async with db.transaction():
+            settings = await db.metadata_source.get_all_metadata_source_settings()
+        provider_setting = next((s for s in settings if s['providerName'] == self.provider_name), None)
+        return provider_setting or {}
 
-    async def get_episode_urls(self, metadata_id: str, target_provider: Optional[str] = None) -> List[Tuple[int, str]]:
+    async def get_episode_urls(self, metadata_id: str, target_provider: Optional[str] = None, *, target_platform: Optional[str] = None) -> List[Tuple[int, str]]:
         """
         获取分集URL列表 (补充源功能)。
 
         Args:
             metadata_id: 豆瓣条目ID
             target_provider: 目标平台 (tencent/iqiyi/youku/bilibili/mgtv), 如果为None则返回所有平台
+            target_platform: 兼容统一调用契约；豆瓣暂无补充平台 key，仍仅按 target_provider 筛选
 
         Returns:
             List[Tuple[int, str]]: (集数, 播放URL) 的列表
@@ -295,11 +451,6 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
         Returns:
             Base64编码的HMAC-SHA1签名
         """
-        import hmac
-        import hashlib
-        import base64
-        from urllib.parse import quote
-
         secret_key = "bf7dddc7c9cfe6f7"
 
         # 构造签名原文: METHOD&URL_PATH&TIMESTAMP
@@ -330,8 +481,6 @@ class DoubanMetadataSource(BaseMetadataSource): # type: ignore
         Returns:
             List[Tuple[int, str]]: (集数, 播放URL) 的列表
         """
-        from datetime import datetime
-
         # 获取配置
         provider_setting = await self._get_provider_setting()
         log_raw = provider_setting.get('logRawResponses', False)

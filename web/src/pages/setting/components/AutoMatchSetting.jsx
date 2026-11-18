@@ -1,16 +1,24 @@
-import React, { useState, useEffect } from 'react'
-import { Form, Input, Select, Switch, Button, message, Spin, Card, Tabs, Space, Tooltip, Row, Col, Alert, Statistic, AutoComplete, InputNumber } from 'antd'
+import { useState, useEffect } from 'react'
+import { Form, Input, Select, Switch, Button, message, Spin, Card, Tabs, Space, Tooltip, Row, Col, Alert, Statistic, AutoComplete, InputNumber, Collapse, Slider } from 'antd'
 const { TextArea } = Input
 const { TabPane } = Tabs
 const { Option } = Select
-import { getConfig, setConfig, getDefaultAIPrompts, getAIBalance, getAIModels } from '@/apis'
+import { getConfig, setConfig, getDefaultAIPrompts, getAIBalance, previewAIModels, saveAIConnection } from '@/apis'
 import api from '@/apis/fetch'
 import { QuestionCircleOutlined, SaveOutlined, ThunderboltOutlined, CheckCircleOutlined, CloseCircleOutlined, ReloadOutlined } from '@ant-design/icons'
 import AIMetrics from './AIMetrics'
-import { useAtomValue } from 'jotai'
-import { isMobileAtom } from '../../../../store/index.js'
+import { SkillManager } from './SkillManager'
+import { useAtomValue, useSetAtom } from 'jotai'
+import {
+  isMobileAtom, assistantEnabledAtom, assistantPetVisibleAtom,
+  ASSISTANT_ENABLED_CONFIG_KEY, ASSISTANT_PET_CONFIG_KEY,
+} from '../../../../store/index.js'
 import { useTranslation } from 'react-i18next'
 import { useHashTab } from '@/hooks/useHashTab'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+
+// AI 页面子 Tab key（与 Header.jsx 中 AI 分组的二级菜单一致）
+export const AI_TAB_KEYS = ['connection', 'match', 'recognition', 'assistant', 'skills', 'metrics']
 
 // 功能搜索锚点 -> 内层 Tab key。定义在模块级保证引用稳定。
 const AUTOMATCH_ANCHOR_TABS = {
@@ -26,13 +34,18 @@ const CustomSwitch = (props) => {
 
 const AutoMatchSetting = () => {
   const { t } = useTranslation()
-  // 功能搜索深链：锚点哈希映射到内层 Tab key
-  const [activeTab, setActiveTab] = useHashTab(AUTOMATCH_ANCHOR_TABS, 'connection')
+  // AI 已拆为独立一级页面：子 Tab 由 URL ?key= 驱动（与侧边栏二级菜单同步），
+  // 功能搜索的锚点哈希仍可映射到对应子 Tab
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const urlKey = searchParams.get('key')
+  const [hashTab] = useHashTab(AUTOMATCH_ANCHOR_TABS, null)
+  const activeTab = AI_TAB_KEYS.includes(urlKey) ? urlKey : (hashTab || 'connection')
+  const setActiveTab = (key) => navigate(`/ai?key=${key}`, { replace: true })
   const [form] = Form.useForm()
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [matchMode, setMatchMode] = useState('traditional')
-  const [fallbackEnabled, setFallbackEnabled] = useState(false)
   const [recognitionEnabled, setRecognitionEnabled] = useState(false)
   const [aliasExpansionEnabled, setAliasExpansionEnabled] = useState(false)
   const [nameConversionEnabled, setNameConversionEnabled] = useState(false)
@@ -51,6 +64,9 @@ const AutoMatchSetting = () => {
   const [selectedPromptType, setSelectedPromptType] = useState('aiRecognitionPrompt') // 当前选中的提示词类型
   const [selectedMatchPromptType, setSelectedMatchPromptType] = useState('aiPrompt') // AI自动匹配的提示词类型
   const isMobile = useAtomValue(isMobileAtom)
+  // 保存助手开关后同步全局状态，让助手入口立即生效
+  const setAssistantEnabled = useSetAtom(assistantEnabledAtom)
+  const setPetVisible = useSetAtom(assistantPetVisibleAtom)
 
   // 加载配置
   const loadSettings = async (providers) => {
@@ -84,7 +100,22 @@ const AutoMatchSetting = () => {
         seasonMappingSourceRes,
         seasonMappingPromptRes,
         episodeGroupEnabledRes,
-        episodeGroupPromptRes
+        episodeGroupPromptRes,
+        asstChannelChatRes,
+        asstNotifyRes,
+        asstNotifyCompleteRes,
+        asstNotifyFailedRes,
+        asstNotifyStartRes,
+        asstNotifyIntervalRes,
+        asstTemperatureRes,
+        asstMaxTokensRes,
+        asstTopPRes,
+        asstPresencePenaltyRes,
+        asstFrequencyPenaltyRes,
+        asstTimeoutRes,
+        asstProxyEnabledRes,
+        asstEnabledRes,
+        asstPetVisibleRes
       ] = await Promise.all([
         getConfig('aiMatchEnabled'),
         getConfig('aiFallbackEnabled'),
@@ -113,7 +144,25 @@ const AutoMatchSetting = () => {
         getConfig('seasonMappingMetadataSource'),
         getConfig('seasonMappingPrompt'),
         getConfig('aiEpisodeGroupEnabled'),
-        getConfig('aiEpisodeGroupPrompt')
+        getConfig('aiEpisodeGroupPrompt'),
+        // 御坂助手配置（容错：不存在时用默认值）
+        getConfig('assistantChannelChatEnabled').catch(() => ({ data: { value: 'true' } })),
+        getConfig('assistantNotifyEnabled').catch(() => ({ data: { value: 'true' } })),
+        getConfig('assistantNotifyOnComplete').catch(() => ({ data: { value: 'true' } })),
+        getConfig('assistantNotifyOnFailed').catch(() => ({ data: { value: 'true' } })),
+        getConfig('assistantNotifyOnStart').catch(() => ({ data: { value: 'false' } })),
+        getConfig('assistantNotifyInterval').catch(() => ({ data: { value: '15' } })),
+        // 御坂助手高级 LLM 参数（容错：不存在时用默认值）
+        getConfig('assistantTemperature').catch(() => ({ data: { value: '0.7' } })),
+        getConfig('assistantMaxTokens').catch(() => ({ data: { value: '2000' } })),
+        getConfig('assistantTopP').catch(() => ({ data: { value: '0.9' } })),
+        getConfig('assistantPresencePenalty').catch(() => ({ data: { value: '0.0' } })),
+        getConfig('assistantFrequencyPenalty').catch(() => ({ data: { value: '0.0' } })),
+        getConfig('assistantTimeout').catch(() => ({ data: { value: '120' } })),
+        getConfig('assistantProxyEnabled').catch(() => ({ data: { value: 'false' } })),
+        // 助手总开关与形象展示开关（都默认关）
+        getConfig(ASSISTANT_ENABLED_CONFIG_KEY).catch(() => ({ data: { value: 'false' } })),
+        getConfig(ASSISTANT_PET_CONFIG_KEY).catch(() => ({ data: { value: 'false' } }))
       ])
 
       const enabled = enabledRes.data.value === 'true'
@@ -126,7 +175,6 @@ const AutoMatchSetting = () => {
       const thinkingEnabled = thinkingEnabledRes.data.value === 'true'
       const episodeGroup = episodeGroupEnabledRes.data.value === 'true'
       setMatchMode(enabled ? 'ai' : 'traditional')
-      setFallbackEnabled(fallback)
       setRecognitionEnabled(recognition)
       setAliasExpansionEnabled(aliasExpansion)
       setNameConversionEnabled(nameConversion)
@@ -163,7 +211,24 @@ const AutoMatchSetting = () => {
         seasonMappingMetadataSource: seasonMappingSourceRes.data.value || 'tmdb',
         seasonMappingPrompt: seasonMappingPromptRes.data.value || '',
         aiEpisodeGroupEnabled: episodeGroup,
-        aiEpisodeGroupPrompt: episodeGroupPromptRes.data.value || ''
+        aiEpisodeGroupPrompt: episodeGroupPromptRes.data.value || '',
+        // 御坂助手
+        assistantChannelChatEnabled: asstChannelChatRes.data.value !== 'false',
+        assistantNotifyEnabled: asstNotifyRes.data.value !== 'false',
+        assistantNotifyOnComplete: asstNotifyCompleteRes.data.value !== 'false',
+        assistantNotifyOnFailed: asstNotifyFailedRes.data.value !== 'false',
+        assistantNotifyOnStart: asstNotifyStartRes.data.value === 'true',
+        assistantNotifyInterval: parseInt(asstNotifyIntervalRes.data.value || '15', 10),
+        // 御坂助手高级 LLM 参数
+        assistantTemperature: parseFloat(asstTemperatureRes.data.value || '0.7'),
+        assistantMaxTokens: parseInt(asstMaxTokensRes.data.value || '2000', 10),
+        assistantTopP: parseFloat(asstTopPRes.data.value || '0.9'),
+        assistantPresencePenalty: parseFloat(asstPresencePenaltyRes.data.value || '0.0'),
+        assistantFrequencyPenalty: parseFloat(asstFrequencyPenaltyRes.data.value || '0.0'),
+        assistantTimeout: parseInt(asstTimeoutRes.data.value || '120', 10),
+        assistantProxyEnabled: asstProxyEnabledRes.data.value === 'true',
+        assistantEnabled: asstEnabledRes.data.value === 'true',
+        assistantPetVisible: asstPetVisibleRes.data.value === 'true',
       })
 
       // 设置当前选中的提供商配置
@@ -186,7 +251,7 @@ const AutoMatchSetting = () => {
         }
       }
     } catch (error) {
-      console.error('加载配置失败:', error)
+      console.error(t('autoMatch.logLoadConfigFailed'), error)
       message.error(t('autoMatch.loadFailed', { error: error?.response?.data?.message || error?.message || error?.detail || String(error) || t('common.unknown') }))
     } finally {
       setLoading(false)
@@ -202,26 +267,26 @@ const AutoMatchSetting = () => {
       setAiProviders(providers)
       return providers
     } catch (error) {
-      console.error('加载AI提供商列表失败:', error)
+      console.error(t('autoMatch.logLoadProvidersFailed'), error)
       // 使用默认配置
       const defaultProviders = [
         {
           id: 'deepseek',
           displayName: 'DeepSeek',
-          modelPlaceholder: '请通过刷新按钮获取模型列表',
-          baseUrlPlaceholder: 'https://api.deepseek.com (默认)'
+          modelPlaceholder: t('autoMatch.modelPlaceholder'),
+          baseUrlPlaceholder: `https://api.deepseek.com ${t('autoMatch.baseUrlDefaultHint')}`
         },
         {
           id: 'siliconflow',
           displayName: 'SiliconFlow 硅基流动',
-          modelPlaceholder: '请通过刷新按钮获取模型列表',
-          baseUrlPlaceholder: 'https://api.siliconflow.cn/v1 (默认)'
+          modelPlaceholder: t('autoMatch.modelPlaceholder'),
+          baseUrlPlaceholder: `https://api.siliconflow.cn/v1 ${t('autoMatch.baseUrlDefaultHint')}`
         },
         {
           id: 'openai',
           displayName: 'OpenAI (兼容接口)',
-          modelPlaceholder: '请通过刷新按钮获取模型列表',
-          baseUrlPlaceholder: 'https://api.openai.com/v1 (默认) 或自定义兼容接口'
+          modelPlaceholder: t('autoMatch.modelPlaceholder'),
+          baseUrlPlaceholder: `https://api.openai.com/v1 ${t('autoMatch.baseUrlDefaultHint')} ${t('autoMatch.baseUrlOpenaiHint')}`
         }
       ]
       setAiProviders(defaultProviders)
@@ -238,6 +303,8 @@ const AutoMatchSetting = () => {
       // fetchBalance() 会在 loadSettings() 中根据提供商配置自动调用
     }
     init()
+    // 初始加载只执行一次；重新绑定函数依赖会覆盖用户正在填写的密钥。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // 更新选中的提供商配置
@@ -263,7 +330,7 @@ const AutoMatchSetting = () => {
       const res = await getAIBalance()
       setBalanceInfo(res.data)
     } catch (error) {
-      console.error('获取余额失败:', error)
+      console.error(t('autoMatch.logFetchBalanceFailed'), error)
       // 不显示错误消息,因为可能是提供商不支持
     } finally {
       setBalanceLoading(false)
@@ -276,15 +343,15 @@ const AutoMatchSetting = () => {
       setSaving(true)
       const values = form.getFieldsValue()
 
-      await Promise.all([
-        setConfig('aiProvider', values.aiProvider || ''),
-        setConfig('aiApiKey', values.aiApiKey || ''),
-        setConfig('aiBaseUrl', values.aiBaseUrl || ''),
-        setConfig('aiModel', values.aiModel || ''),
-        setConfig('aiLogRawResponse', values.aiLogRawResponse ? 'true' : 'false'),
-        setConfig('aiThinkingEnabled', values.aiThinkingEnabled ? 'true' : 'false'),
-        setConfig('aiCallTimeout', String(values.aiCallTimeout || 60))
-      ])
+      await saveAIConnection({
+        aiProvider: values.aiProvider || '',
+        aiApiKey: values.aiApiKey || '',
+        aiBaseUrl: values.aiBaseUrl || '',
+        aiModel: values.aiModel || '',
+        aiLogRawResponse: !!values.aiLogRawResponse,
+        aiThinkingEnabled: !!values.aiThinkingEnabled,
+        aiCallTimeout: Number(values.aiCallTimeout || 60),
+      })
 
       message.success(t('autoMatch.saveConnectionSuccess'))
 
@@ -293,7 +360,7 @@ const AutoMatchSetting = () => {
         fetchBalance()
       }
     } catch (error) {
-      console.error('保存配置失败:', error)
+      console.error(t('autoMatch.logSaveConfigFailed'), error)
       message.error(t('autoMatch.saveFailed', { error: error?.response?.data?.message || error?.message || t('common.unknown') }))
     } finally {
       setSaving(false)
@@ -324,7 +391,7 @@ const AutoMatchSetting = () => {
 
       message.success(t('autoMatch.saveMatchSuccess'))
     } catch (error) {
-      console.error('保存配置失败:', error)
+      console.error(t('autoMatch.logSaveConfigFailed'), error)
       message.error(t('autoMatch.saveFailed', { error: error?.response?.data?.message || error?.message || t('common.unknown') }))
     } finally {
       setSaving(false)
@@ -350,7 +417,51 @@ const AutoMatchSetting = () => {
 
       message.success(t('autoMatch.saveRecognitionSuccess'))
     } catch (error) {
-      console.error('保存配置失败:', error)
+      console.error(t('autoMatch.logSaveConfigFailed'), error)
+      message.error(t('autoMatch.saveFailed', { error: error?.response?.data?.message || error?.message || t('common.unknown') }))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  // 保存 Tab: 御坂助手
+  const handleSaveAssistantConfig = async () => {
+    try {
+      setSaving(true)
+      const values = form.getFieldsValue()
+      const interval = Math.min(60, Math.max(10, parseInt(values.assistantNotifyInterval || 15, 10) || 15))
+      const timeout = Math.min(300, Math.max(10, parseInt(values.assistantTimeout || 120, 10) || 120))
+      const temperature = Math.min(2, Math.max(0, parseFloat(values.assistantTemperature || 0.7) || 0.7))
+      const maxTokens = Math.min(8000, Math.max(100, parseInt(values.assistantMaxTokens || 2000, 10) || 2000))
+      const topP = Math.min(1, Math.max(0, parseFloat(values.assistantTopP || 0.9) || 0.9))
+      const presencePenalty = Math.min(2, Math.max(-2, parseFloat(values.assistantPresencePenalty || 0) || 0))
+      const frequencyPenalty = Math.min(2, Math.max(-2, parseFloat(values.assistantFrequencyPenalty || 0) || 0))
+
+      await Promise.all([
+        setConfig('assistantChannelChatEnabled', values.assistantChannelChatEnabled ? 'true' : 'false'),
+        setConfig('assistantNotifyEnabled', values.assistantNotifyEnabled ? 'true' : 'false'),
+        setConfig('assistantNotifyOnComplete', values.assistantNotifyOnComplete ? 'true' : 'false'),
+        setConfig('assistantNotifyOnFailed', values.assistantNotifyOnFailed ? 'true' : 'false'),
+        setConfig('assistantNotifyOnStart', values.assistantNotifyOnStart ? 'true' : 'false'),
+        setConfig('assistantNotifyInterval', String(interval)),
+        // 高级 LLM 参数
+        setConfig('assistantTemperature', String(temperature)),
+        setConfig('assistantMaxTokens', String(maxTokens)),
+        setConfig('assistantTopP', String(topP)),
+        setConfig('assistantPresencePenalty', String(presencePenalty)),
+        setConfig('assistantFrequencyPenalty', String(frequencyPenalty)),
+        setConfig('assistantTimeout', String(timeout)),
+        setConfig('assistantProxyEnabled', values.assistantProxyEnabled ? 'true' : 'false'),
+        setConfig(ASSISTANT_ENABLED_CONFIG_KEY, values.assistantEnabled ? 'true' : 'false'),
+        setConfig(ASSISTANT_PET_CONFIG_KEY, values.assistantPetVisible ? 'true' : 'false'),
+      ])
+      // 保存成功后同步全局状态，助手立即显示/隐藏，无需刷新页面
+      setAssistantEnabled(!!values.assistantEnabled)
+      setPetVisible(!!values.assistantPetVisible)
+      window.dispatchEvent(new Event('assistant-notify-config-changed'))
+      message.success(t('autoMatch.assistantSaveSuccess'))
+    } catch (error) {
+      console.error(t('autoMatch.logSaveConfigFailed'), error)
       message.error(t('autoMatch.saveFailed', { error: error?.response?.data?.message || error?.message || t('common.unknown') }))
     } finally {
       setSaving(false)
@@ -373,7 +484,11 @@ const AutoMatchSetting = () => {
 
     try {
       setRefreshingModels(true)
-      const response = await getAIModels(currentProvider, true)
+      const response = await previewAIModels({
+        provider: currentProvider,
+        apiKey: form.getFieldValue('aiApiKey') || '',
+        baseUrl: form.getFieldValue('aiBaseUrl') || '',
+      })
 
       if (response.data.error) {
         message.warning(response.data.error)
@@ -395,8 +510,8 @@ const AutoMatchSetting = () => {
         }
       }
     } catch (error) {
-      console.error('刷新模型列表失败:', error)
-      message.error(t('autoMatch.refreshModelsFailed', { error: error.response?.data?.detail || error.message }))
+      console.error(t('autoMatch.logRefreshModelsFailed'), error)
+      message.error(t('autoMatch.refreshModelsFailed', { error: error.message || error.detail || t('common.unknown') }))
     } finally {
       setRefreshingModels(false)
     }
@@ -483,23 +598,20 @@ const AutoMatchSetting = () => {
         message.error(t('autoMatch.fillDefaultNotFound'))
       }
     } catch (error) {
-      console.error('获取默认提示词失败:', error)
+      console.error(t('autoMatch.logFetchDefaultPromptFailed'), error)
       message.error(t('autoMatch.fillDefaultFailed', { error: error?.response?.data?.message || error?.message || t('common.unknown') }))
     }
   }
 
   return (
     <Spin spinning={loading}>
-      <Card>
+      <>
         <Form
           form={form}
           layout="vertical"
           onValuesChange={(changedValues) => {
             if ('aiMatchEnabled' in changedValues) {
               setMatchMode(changedValues.aiMatchEnabled ? 'ai' : 'traditional')
-            }
-            if ('aiFallbackEnabled' in changedValues) {
-              setFallbackEnabled(changedValues.aiFallbackEnabled)
             }
             if ('aiRecognitionEnabled' in changedValues) {
               setRecognitionEnabled(changedValues.aiRecognitionEnabled)
@@ -512,9 +624,10 @@ const AutoMatchSetting = () => {
             }
           }}
         >
-          <Tabs activeKey={activeTab} onChange={setActiveTab}>
-            {/* 标签页1: AI连接配置 */}
+          <Tabs className="page-tabs" activeKey={activeTab} onChange={setActiveTab}>
+            {/* 标签页1: 连接配置 */}
             <TabPane tab={t('autoMatch.tabConnection')} key="connection">
+              <Card>
               <div id="feat-ai-connection" />
               <Form.Item
                 name="aiProvider"
@@ -812,10 +925,12 @@ const AutoMatchSetting = () => {
                   {t('autoMatch.btnSaveConnection')}
                 </Button>
               </div>
+              </Card>
             </TabPane>
 
-            {/* 标签页2: AI自动匹配 */}
+            {/* 标签页2: 自动匹配 */}
             <TabPane tab={t('autoMatch.tabMatch')} key="match">
+              <Card>
               <div id="feat-ai-match" />
               <Row gutter={[16, 16]}>
                 <Col xs={24} sm={8}>
@@ -1082,10 +1197,12 @@ const AutoMatchSetting = () => {
                   {t('autoMatch.btnSaveMatch')}
                 </Button>
               </div>
+              </Card>
             </TabPane>
 
-            {/* 标签页3: AI识别增强 */}
+            {/* 标签页3: 识别增强 */}
             <TabPane tab={t('autoMatch.tabRecognition')} key="recognition">
+              <Card>
               <div id="feat-ai-recognition" />
               <Row gutter={[16, 16]}>
                 <Col xs={24} sm={6}>
@@ -1212,17 +1329,166 @@ const AutoMatchSetting = () => {
                   {t('autoMatch.btnSaveRecognition')}
                 </Button>
               </div>
+              </Card>
             </TabPane>
 
-            {/* 标签页4: AI使用统计 */}
+            {/* 标签页: 御坂助手（看板娘对话 + 任务播报） */}
+            <TabPane tab={t('autoMatch.assistantTab')} key="assistant">
+              <Card>
+              <Alert
+                type="info"
+                message={t('autoMatch.assistantAlertTitle')}
+                description={t('autoMatch.assistantAlertDesc')}
+                style={{ marginBottom: 16 }}
+              />
+              <Row gutter={[16, 16]}>
+                {/* 助手总开关：关闭后网页端不显示助手入口与面板 */}
+                <Col xs={24} sm={12}>
+                  <Form.Item name="assistantEnabled" valuePropName="checked"
+                    label={t('autoMatch.assistantEnabledLabel')} tooltip={t('autoMatch.assistantEnabledTooltip')}>
+                    <CustomSwitch />
+                  </Form.Item>
+                </Col>
+                {/* 形象展示开关：关闭时只显示简洁圆形按钮 */}
+                <Col xs={24} sm={12}>
+                  <Form.Item name="assistantPetVisible" valuePropName="checked"
+                    label={t('autoMatch.assistantPetVisibleLabel')} tooltip={t('autoMatch.assistantPetVisibleTooltip')}>
+                    <CustomSwitch />
+                  </Form.Item>
+                </Col>
+                <Col xs={24} sm={12}>
+                  <Form.Item name="assistantChannelChatEnabled" valuePropName="checked"
+                    label={t('autoMatch.assistantChannelChatLabel')} tooltip={t('autoMatch.assistantChannelChatTooltip')}>
+                    <CustomSwitch />
+                  </Form.Item>
+                </Col>
+                <Col xs={24} sm={12}>
+                  <Form.Item name="assistantNotifyEnabled" valuePropName="checked"
+                    label={t('autoMatch.assistantNotifyEnabledLabel')} tooltip={t('autoMatch.assistantNotifyEnabledTooltip')}>
+                    <CustomSwitch />
+                  </Form.Item>
+                </Col>
+                <Col xs={24} sm={12}>
+                  <Form.Item name="assistantNotifyOnComplete" valuePropName="checked" label={t('autoMatch.assistantNotifyOnCompleteLabel')}>
+                    <CustomSwitch />
+                  </Form.Item>
+                </Col>
+                <Col xs={24} sm={12}>
+                  <Form.Item name="assistantNotifyOnFailed" valuePropName="checked" label={t('autoMatch.assistantNotifyOnFailedLabel')}>
+                    <CustomSwitch />
+                  </Form.Item>
+                </Col>
+                <Col xs={24} sm={12}>
+                  <Form.Item name="assistantNotifyOnStart" valuePropName="checked"
+                    label={t('autoMatch.assistantNotifyOnStartLabel')} tooltip={t('autoMatch.assistantNotifyOnStartTooltip')}>
+                    <CustomSwitch />
+                  </Form.Item>
+                </Col>
+                <Col xs={24} sm={12}>
+                  <Form.Item name="assistantNotifyInterval"
+                    label={t('autoMatch.assistantNotifyIntervalLabel')} tooltip={t('autoMatch.assistantNotifyIntervalTooltip')}>
+                    <InputNumber min={10} max={60} style={{ width: '100%' }} />
+                  </Form.Item>
+                </Col>
+              </Row>
+
+              {/* 高级 LLM 参数（参考 MoviePilot AI Agent，默认展开可折叠） */}
+              <Collapse
+                defaultActiveKey={['advanced']}
+                style={{ marginTop: 16 }}
+                items={[{
+                  key: 'advanced',
+                  label: t('autoMatch.assistantAdvancedTitle'),
+                  children: (
+                    <>
+                      <Alert
+                        type="info"
+                        message={t('autoMatch.assistantAdvancedDesc')}
+                        style={{ marginBottom: 16 }}
+                      />
+                      <Row gutter={[16, 8]}>
+                        <Col xs={24} sm={12}>
+                          <Form.Item name="assistantTemperature"
+                            label={t('autoMatch.assistantTemperatureLabel')}
+                            tooltip={t('autoMatch.assistantTemperatureTooltip')}>
+                            <Slider min={0} max={2} step={0.1} marks={{ 0: '0', 0.7: '0.7', 2: '2' }} />
+                          </Form.Item>
+                        </Col>
+                        <Col xs={24} sm={12}>
+                          <Form.Item name="assistantTopP"
+                            label={t('autoMatch.assistantTopPLabel')}
+                            tooltip={t('autoMatch.assistantTopPTooltip')}>
+                            <Slider min={0} max={1} step={0.05} marks={{ 0: '0', 0.9: '0.9', 1: '1' }} />
+                          </Form.Item>
+                        </Col>
+                        <Col xs={24} sm={12}>
+                          <Form.Item name="assistantPresencePenalty"
+                            label={t('autoMatch.assistantPresencePenaltyLabel')}
+                            tooltip={t('autoMatch.assistantPresencePenaltyTooltip')}>
+                            <Slider min={-2} max={2} step={0.1} marks={{ '-2': '-2', 0: '0', 2: '2' }} />
+                          </Form.Item>
+                        </Col>
+                        <Col xs={24} sm={12}>
+                          <Form.Item name="assistantFrequencyPenalty"
+                            label={t('autoMatch.assistantFrequencyPenaltyLabel')}
+                            tooltip={t('autoMatch.assistantFrequencyPenaltyTooltip')}>
+                            <Slider min={-2} max={2} step={0.1} marks={{ '-2': '-2', 0: '0', 2: '2' }} />
+                          </Form.Item>
+                        </Col>
+                        <Col xs={24} sm={12}>
+                          <Form.Item name="assistantMaxTokens"
+                            label={t('autoMatch.assistantMaxTokensLabel')}
+                            tooltip={t('autoMatch.assistantMaxTokensTooltip')}>
+                            <InputNumber min={100} max={8000} step={100} style={{ width: '100%' }} />
+                          </Form.Item>
+                        </Col>
+                        <Col xs={24} sm={12}>
+                          <Form.Item name="assistantTimeout"
+                            label={t('autoMatch.assistantTimeoutLabel')}
+                            tooltip={t('autoMatch.assistantTimeoutTooltip')}>
+                            <InputNumber min={10} max={300} step={10} style={{ width: '100%' }} />
+                          </Form.Item>
+                        </Col>
+                        <Col xs={24} sm={12}>
+                          <Form.Item name="assistantProxyEnabled" valuePropName="checked"
+                            label={t('autoMatch.assistantProxyEnabledLabel')}
+                            tooltip={t('autoMatch.assistantProxyEnabledTooltip')}>
+                            <CustomSwitch />
+                          </Form.Item>
+                        </Col>
+                      </Row>
+                    </>
+                  ),
+                }]}
+              />
+
+              <div style={{ marginTop: '24px', textAlign: 'center' }}>
+                <Button type="primary" icon={<SaveOutlined />} onClick={handleSaveAssistantConfig}
+                  loading={saving} size="large" style={{ minWidth: '200px' }}>
+                  {t('autoMatch.assistantSaveBtn')}
+                </Button>
+              </div>
+              </Card>
+            </TabPane>
+
+            {/* 标签页: 御坂技能管理（用户可自制 skill 到 config/skills/） */}
+            <TabPane tab={t('autoMatch.skillsTab')} key="skills">
+              <Card>
+              <SkillManager />
+              </Card>
+            </TabPane>
+
+            {/* 标签页4: 使用统计 */}
             <TabPane tab={t('autoMatch.tabMetrics')} key="metrics">
+              <Card>
               <AIMetrics />
+              </Card>
             </TabPane>
           </Tabs>
         </Form>
 
         {/* 说明文字 */}
-        <div className="mt-6 p-4 rounded" style={{ backgroundColor: 'var(--color-card)' }}>
+        <Card className="mt-6">
           <h4 className="mt-0" style={{ color: 'var(--color-text)' }}>{t('autoMatch.descTitle')}</h4>
           <ul style={{ marginBottom: 0, paddingLeft: 20, color: 'var(--color-text)' }}>
             <li dangerouslySetInnerHTML={{ __html: t('autoMatch.descTraditional') }} />
@@ -1245,8 +1511,8 @@ const AutoMatchSetting = () => {
             </li>
             <li dangerouslySetInnerHTML={{ __html: t('autoMatch.descPrecision') }} />
           </ul>
-        </div>
-      </Card>
+        </Card>
+      </>
     </Spin>
   )
 }

@@ -23,6 +23,14 @@ export const FEATURES = [
     titleKey: 'features.homeSearch.title',
     descKey: 'features.homeSearch.desc',
     keywords: ['搜索', '搜番', '搜剧', 'search', 'anime', '导入', 'import'],
+    // 搜索页已从首页独立到 /search（首页现为仪表盘）
+    path: '/search', tabKey: '', icon: 'home',
+  },
+  {
+    id: 'home-dashboard',
+    titleKey: 'features.homeDashboard.title',
+    descKey: 'features.homeDashboard.desc',
+    keywords: ['首页', '仪表盘', '概览', '健康', 'dashboard', 'home', 'overview'],
     path: '/', tabKey: '', icon: 'home',
   },
 
@@ -84,6 +92,13 @@ export const FEATURES = [
     descKey: 'features.taskProfile.desc',
     keywords: ['任务画像', '统计', 'profile', '分析'],
     path: '/task', tabKey: 'profile', icon: 'tongji-jinhangzhongderenwushuliang',
+  },
+  {
+    id: 'task-sysmetrics',
+    titleKey: 'features.taskSysMetrics.title',
+    descKey: 'features.taskSysMetrics.desc',
+    keywords: ['系统指标', '内存', 'CPU', '性能', '监控', 'metrics', 'memory', 'cpu'],
+    path: '/task', tabKey: 'sysmetrics', icon: 'tongji-jinhangzhongderenwushuliang',
   },
 
   // ============ 弹幕（Token 页子卡片）============
@@ -159,13 +174,27 @@ export const FEATURES = [
     keywords: ['数据校验', '数据检查', 'data check', '一致性'],
     path: '/bullet', tabKey: 'data-check', icon: 'renlianshibie_o',
   },
+  {
+    id: 'api-test',
+    titleKey: 'features.apiTest.title',
+    descKey: 'features.apiTest.desc',
+    keywords: ['接口测试', '测试', 'match', '匹配测试', '分集', '弹幕获取', 'api test'],
+    path: '/api-test', tabKey: '', icon: 'a-Webceshi',
+  },
 
-  // ============ 媒体获取 ============
+  // ============ 媒体服务联动 ============
+  {
+    id: 'media-connection',
+    titleKey: 'features.mediaConnection.title',
+    descKey: 'features.mediaConnection.desc',
+    keywords: ['媒体服务连接', '媒体服务器', 'emby', 'jellyfin', 'plex', '添加服务器', 'server'],
+    path: '/media-fetch', tabKey: 'connection', icon: 'liumeitifuwu',
+  },
   {
     id: 'media-library-scan',
     titleKey: 'features.mediaLibraryScan.title',
     descKey: 'features.mediaLibraryScan.desc',
-    keywords: ['媒体库读取', 'emby', 'jellyfin', 'plex', '扫描', 'scan', '媒体服务器'],
+    keywords: ['媒体项目扫描', '媒体服务扫描', '媒体库读取', 'emby', 'jellyfin', 'plex', '扫描', 'scan'],
     path: '/media-fetch', tabKey: 'library-scan', icon: 'meitiduqu',
   },
   {
@@ -277,13 +306,13 @@ export const FEATURES = [
     titleKey: 'features.settingWebhook.title',
     descKey: 'features.settingWebhook.desc',
     keywords: ['webhook配置', 'webhook', '延时导入', '自动化导入'],
-    path: '/setting', tabKey: 'webhook', icon: 'webhookpeizhi',
+    path: '/media-fetch', tabKey: 'webhook', icon: 'webhookpeizhi',
   },
   {
     id: 'setting-notification',
     titleKey: 'features.settingNotification.title',
     descKey: 'features.settingNotification.desc',
-    keywords: ['通知', 'notification', 'telegram', '消息推送', 'bark'],
+    keywords: ['通知', '通知配置', '交互', 'notification', 'telegram', '消息推送', 'bark'],
     path: '/setting', tabKey: 'notification', icon: 'jiaohu',
   },
   {
@@ -305,28 +334,28 @@ export const FEATURES = [
     titleKey: 'features.settingAutomatch.title',
     descKey: 'features.settingAutomatch.desc',
     keywords: ['自动匹配', 'ai匹配', 'automatch', '季度映射', '剧集组', 'ai'],
-    path: '/setting', tabKey: 'automatch', icon: 'ai',
+    path: '/ai', tabKey: 'connection', icon: 'ai1',
   },
   {
     id: 'automatch-connection',
     titleKey: 'features.automatchConnection.title',
     descKey: 'features.automatchConnection.desc',
     keywords: ['ai连接', 'ai key', 'openai', 'deepseek', 'gemini', 'claude', 'ai模型', 'api key', 'base url'],
-    path: '/setting', tabKey: 'automatch', anchor: 'feat-ai-connection', icon: 'ai',
+    path: '/ai', tabKey: 'connection', anchor: 'feat-ai-connection', icon: 'ai1',
   },
   {
     id: 'automatch-season-mapping',
     titleKey: 'features.automatchSeasonMapping.title',
     descKey: 'features.automatchSeasonMapping.desc',
     keywords: ['季度映射', 'tmdb季度', '剧集组', 'season mapping', '映射配置', '季度配置'],
-    path: '/setting', tabKey: 'automatch', anchor: 'feat-ai-season-mapping', icon: 'ai',
+    path: '/ai', tabKey: 'match', anchor: 'feat-ai-season-mapping', icon: 'ai1',
   },
   {
     id: 'automatch-recognition',
     titleKey: 'features.automatchRecognition.title',
     descKey: 'features.automatchRecognition.desc',
     keywords: ['ai识别', '识别增强', '别名纠错', '别名扩展', '名称转换', 'ai recognition', '简繁'],
-    path: '/setting', tabKey: 'automatch', anchor: 'feat-ai-recognition', icon: 'ai',
+    path: '/ai', tabKey: 'recognition', anchor: 'feat-ai-recognition', icon: 'ai1',
   },
   {
     id: 'setting-security',

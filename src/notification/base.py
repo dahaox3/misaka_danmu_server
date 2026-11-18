@@ -12,6 +12,11 @@ import logging
 import time
 
 from src.notification.messages.base import NotificationMessage, RenderedMessage
+# 通知和检索共用图片资源流程，保持缓存路径一致。
+from src.workflows.image_resources import save_public_thumbnail
+from src.utils.misc.image_processing import (
+    THUMBNAIL_FORMAT_JPEG, THUMBNAIL_SUFFIXES,
+)
 
 
 # ═══════════════════════════════════════════
@@ -28,6 +33,7 @@ class ChannelCapability(Enum):
     RICH_TEXT = "rich_text"                  # 支持富文本（Markdown/HTML）
     IMAGES = "images"                        # 支持图片发送
     LINKS = "links"                          # 支持链接
+    RICH_MESSAGE = "rich_message"            # 支持「结构化富消息」
 
 
 # ── 图片发送模式（各渠道通用）──
@@ -77,6 +83,11 @@ class ChannelCapabilities:
     @property
     def supports_callbacks(self) -> bool:
         return self.supports(ChannelCapability.CALLBACK_QUERIES)
+
+    @property
+    def supports_rich_message(self) -> bool:
+        """是否支持结构化富消息（表格、标题、脚注、公式等）。"""
+        return self.supports(ChannelCapability.RICH_MESSAGE)
 
     @property
     def supports_editing(self) -> bool:
@@ -282,6 +293,10 @@ class BaseNotificationChannel(ABC):
         """
         return False
 
+    # 外链模式下平台抓取图片的格式。默认 JPEG：Telegram/QQ/企业微信按 URL 抓取
+    # WebP 会报「wrong type of the web page content」等错误；确认支持 WebP 的渠道覆写为 webp。
+    public_image_format: str = THUMBNAIL_FORMAT_JPEG
+
     @property
     def image_mode(self) -> str:
         """当前渠道的图片发送模式（text / poster / separate / public_url）"""
@@ -330,16 +345,19 @@ class BaseNotificationChannel(ABC):
         if not base:
             return ""
 
+        fmt = self.public_image_format
+        suffix = THUMBNAIL_SUFFIXES[fmt]
         if image_url.startswith(f"{base}/data/images/"):
-            return image_url
-
+            # 已是本站外链且格式符合渠道要求时直接复用；格式不符则读取本地文件转码。
+            if image_url.split("?", 1)[0].lower().endswith(suffix):
+                return image_url
+            image_url = image_url[len(base):]
         source = image_bytes or image_url
         if not source:
             return ""
 
         try:
-            from src.utils.image_utils import save_public_thumbnail
-            web_path = await save_public_thumbnail(source)
+            web_path = await save_public_thumbnail(source, fmt=fmt)
         except Exception as e:
             self.logger.warning(f"生成对外分享缩略图失败: {e}")
             return ""
@@ -379,7 +397,9 @@ class BaseNotificationChannel(ABC):
             image_ref = rendered.image
             image_bytes = rendered.image_bytes
 
-            if mode == IMAGE_MODE_PUBLIC_URL:
+            # why：无图消息（如数据库备份等定时任务完成通知）本就没有可外链的图片，
+            # 不应进入外链流程，否则会误报"外链模式不可用"
+            if mode == IMAGE_MODE_PUBLIC_URL and (image_ref or image_bytes):
                 original_image = image_ref
                 public_url = await self._build_public_image_url(rendered)
                 if public_url:
@@ -393,11 +413,16 @@ class BaseNotificationChannel(ABC):
                             NotificationMessage._escape_markdown(public_url),
                         )
                 else:
-                    self.logger.warning(
-                        "外链模式不可用，本次按海报模式发送。"
-                        "请在「弹幕 → Token 管理 → 自定义域名」填写公网可访问的 "
-                        "HTTPS 域名（必须以 https:// 开头，http 地址平台会拒绝加载）"
-                    )
+                    # why：区分"没配 https 域名"和"缩略图生成失败"，后者已在
+                    # build_public_image_url 里记录具体原因，不能再提示去改域名
+                    if not self.public_base_url():
+                        self.logger.warning(
+                            "外链模式不可用，本次按海报模式发送。"
+                            "请在「弹幕 → Token 管理 → 自定义域名」填写公网可访问的 "
+                            "HTTPS 域名（必须以 https:// 开头，http 地址平台会拒绝加载）"
+                        )
+                    else:
+                        self.logger.warning("外链缩略图生成失败，本次按海报模式发送。")
                     mode = IMAGE_MODE_POSTER
 
             if image_ref:
@@ -411,6 +436,9 @@ class BaseNotificationChannel(ABC):
         if rendered.edit_message_id:
             kwargs["edit_message_id"] = rendered.edit_message_id
         kwargs.update(rendered.metadata)
+        # 模板标题与正文分开渲染；正文为空时仍发送标题，避免平台拒绝空消息。
+        if not body.strip() and title.strip():
+            body = title
         kwargs["article_title"] = title
         await self.send_message(title="", text=body, **kwargs)
 

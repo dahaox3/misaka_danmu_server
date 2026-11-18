@@ -3,9 +3,11 @@ from typing import Callable, Dict, Any, List
 import logging
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from src.services import TaskManager, ScraperManager, MetadataSourceManager
 from src.rate_limiter import RateLimiter
-from src.db import ConfigManager
+from src.services.config_service import ConfigService
+from src.services.metadata_service import MetadataService
+from src.services.scraper_manager import ScraperManager
+from src.services.task_manager import TaskManager
 
 class BaseJob(ABC):
     """
@@ -38,20 +40,30 @@ class BaseJob(ABC):
     """
     # 每个子类都必须覆盖这些类属性
     job_type: str = "" # 任务的唯一标识符, e.g., "incremental_refresh"
-    job_name: str = "" # 任务的默认显示名称, e.g., "TMDB自动映射与更新"
+    job_name: str = "" # 任务的默认显示名称, e.g., "自动刮削与剧集组映射"
     description: str = "" # 任务的详细描述，用于前端显示
     is_system_task: bool = False  # 标识是否为系统内置任务
     config_schema: List[Dict[str, Any]] = []  # 任务可配置项的 schema 定义
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], task_manager: TaskManager, scraper_manager: ScraperManager, rate_limiter: RateLimiter, metadata_manager: MetadataSourceManager, config_manager: ConfigManager, title_recognition_manager=None, ai_matcher_manager=None):
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        task_manager: "TaskManager",
+        scraper_manager: "ScraperManager",
+        rate_limiter: "RateLimiter",
+        metadata_manager: "MetadataService",
+        config_service: "ConfigService",
+        title_recognition_manager=None,
+        ai_service=None,
+    ):
         self._session_factory = session_factory
         self.task_manager = task_manager
         self.scraper_manager = scraper_manager
         self.rate_limiter = rate_limiter
         self.metadata_manager = metadata_manager
-        self.config_manager = config_manager
+        self.config_service = config_service
         self.title_recognition_manager = title_recognition_manager
-        self.ai_matcher_manager = ai_matcher_manager
+        self.ai_service = ai_service
         self.logger = logging.getLogger(self.__class__.__name__)
 
     @abstractmethod
