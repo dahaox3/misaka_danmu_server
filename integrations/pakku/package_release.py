@@ -1,6 +1,7 @@
 """Package built extensions and corresponding source; never include run data."""
 import argparse
 import hashlib
+import io
 import json
 import subprocess
 import tarfile
@@ -33,8 +34,14 @@ def main():
         for name in files:
             archive.add(ROOT / name, arcname='overrides/' + name)
         archive.add(ROOT / 'web/dist', arcname='overrides/web-dist')
-        for name in ('pakku_gateway.py', 'pakku_entrypoint.py', 'run-gateway.sh'):
+        for name in ('pakku_gateway.py', 'pakku_entrypoint.py'):
             archive.add(HERE / name, arcname='gateway/' + name)
+        # Windows checkouts can have CRLF and no executable bit. /exec.sh runs
+        # this file directly after dropping privileges in the Linux container.
+        script = (HERE / 'run-gateway.sh').read_bytes().replace(b'\r\n', b'\n')
+        entry = tarfile.TarInfo('gateway/run-gateway.sh')
+        entry.mode, entry.size = 0o755, len(script)
+        archive.addfile(entry, io.BytesIO(script))
         for name in ('engine.mjs', 'server.mjs', 'similarity-gen.wasm', 'LICENSE.pakku.txt', 'README.md', 'provenance.json'):
             archive.add(HERE / name, arcname='pakku/' + name)
     print(json.dumps({'file': str(args.output), 'bytes': args.output.stat().st_size,
