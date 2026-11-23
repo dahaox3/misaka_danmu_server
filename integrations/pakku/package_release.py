@@ -29,7 +29,8 @@ def main():
     (ROOT / 'web/dist/pakku-integration-source.tar.gz').write_bytes(source.read_bytes())
     files = ('src/workflows/comments/danmaku_flow.py', 'src/db/repositories/episode_query.py',
              'src/core/pakku_recent.py', 'src/core/pakku_settings.py',
-             'src/api/ui/pakku_config.py', 'src/api/dandan/pakku_merge.py', 'src/api/dandan/pakku_output.py')
+             'src/api/ui/diagnostics.py', 'src/api/ui/pakku_config.py',
+             'src/api/dandan/pakku_merge.py', 'src/api/dandan/pakku_output.py')
     with tarfile.open(args.output, 'w:gz') as archive:
         for name in files:
             archive.add(ROOT / name, arcname='overrides/' + name)

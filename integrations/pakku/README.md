@@ -1,6 +1,6 @@
 # Misaka + pakku：最新发送弹幕与重复合并
 
-此集成适配 Misaka v2.9.2（弹幕源包 v3.0.1）；浏览器 pakku 引擎固定引用 dahaox3/pakku.js 的 3477ee088217c6a1bd258c7c00d73097cef38ec9。
+此集成适配 Misaka v2.9.3（弹幕源包 v3.0.1）；浏览器 pakku 引擎固定引用 dahaox3/pakku.js 的 3477ee088217c6a1bd258c7c00d73097cef38ec9。部署包也包含诊断路由的修正，使 v2.9.3 声明的登录依赖实际生效。
 
 - 输出设置中提供全部、最新1000/3000/5000/10000条与自定义数量。
 - 直接复用用户 fork 的 `select_latest`：按发送日期排序，超大ID以十进制字符串精确比较；先选择，再合并。
@@ -44,4 +44,4 @@ Misaka及Python/前端集成为AGPL-3.0（见项目LICENSE）。Node侧车、ada
 
 使用普通 Git merge 保留共同祖先。在临时分支执行 `git fetch upstream main` 和 `git merge upstream/main`。合并后检查播放 workflow 的两个读取分支是否都使用请求级 reader，预览列表是否仍通过 DatabaseService 查询，设置路由是否仍依赖上游身份验证服务。Pakku 关闭最新筛选时直接使用原生 reader。后台任务无需安装钩子。
 
-在与合并提交匹配的上游镜像中测试，构建覆盖包后执行 `bash integrations/pakku/verify-release.sh /path/to/pakku-release.tar.gz ghcr.io/l429609201/misaka_danmu_server:v2.9.2`。脚本在无网络的临时容器里使用包内文件导入真实入口并运行 Python 回归。先用独立数据库副本启动，验证健康、原弹幕源加载、配置鉴权和真实播放器输出，再替换生产部署。覆盖包包含同一提交的 workflow 与 episode_query 文件，不可跨上游版本复用。升级主程序时同时检查上游资源包的兼容版本。
+在与合并提交匹配的上游镜像中测试，构建覆盖包后执行 `bash integrations/pakku/verify-release.sh /path/to/pakku-release.tar.gz ghcr.io/l429609201/misaka_danmu_server:v2.9.3`。脚本在无网络的临时容器里使用包内文件导入真实入口并运行 Python 回归。先用独立数据库副本启动，验证健康、原弹幕源加载、配置鉴权和真实播放器输出，再替换生产部署。覆盖包包含同一提交的 workflow 与 episode_query 文件，不可跨上游版本复用。升级主程序时同时检查上游资源包的兼容版本。

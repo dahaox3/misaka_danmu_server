@@ -1,4 +1,4 @@
-# Merge these settings into your existing v2.9.2 deployment; retain your own secrets and databases.
+# Merge these settings into your existing v2.9.3 deployment; retain your own secrets and databases.
 services:
   misaka-danmu-server:
     environment:
@@ -12,6 +12,7 @@ services:
       - ./release/overrides/src/core/pakku_recent.py:/app/src/core/pakku_recent.py:ro
       - ./release/overrides/src/core/pakku_settings.py:/app/src/core/pakku_settings.py:ro
       - ./release/overrides/src/api/ui/pakku_config.py:/app/src/api/ui/pakku_config.py:ro
+      - ./release/overrides/src/api/ui/diagnostics.py:/app/src/api/ui/diagnostics.py:ro
       - ./release/overrides/src/api/dandan/pakku_merge.py:/app/src/api/dandan/pakku_merge.py:ro
       - ./release/overrides/src/api/dandan/pakku_output.py:/app/src/api/dandan/pakku_output.py:ro
       - ./release/overrides/web-dist:/app/web/dist:ro
